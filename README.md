@@ -1,19 +1,19 @@
 # smooth-attn
 
-Smooth softplus-family attention normalization kernels for PyTorch + Triton.
+Smooth squareplus attention normalization kernels for PyTorch + Triton.
 
 `smooth-attn` packages the prototype you built here into a cleaner repo shape:
 - Triton forward kernels for row-wise and causal normalization
 - a production-focused causal benchmark centered on reusable output buffers
 - a differentiable training API with Triton forward and safe eager backward
-- configurable smooth families of the form `softplus(alpha * (x - theta))^power / sum`
+- the winning squareplus family `squareplus(alpha * (x - theta))^power / sum`
 
 ## Why this exists
 
 Softmax is not the only useful normalization for attention. This repo explores a smooth thresholded family that keeps the operator normalized while changing the geometry of the scores:
 
 ```text
-softplus(alpha * (x - theta))^power / sum
+squareplus(alpha * (x - theta))^power / sum
 ```
 
 In the current prototype, the best regime is causal attention in mixed precision. On the local RTX 4090 runs from this workspace, the `bf16` causal family kernel reached a geometric mean of roughly `0.81x` vs PyTorch masked softmax timing, meaning about `1.24x` faster overall in that benchmark configuration. Results will vary by GPU, Triton version, and shape mix.
@@ -120,6 +120,7 @@ triton_kernel.py
 
 - This project currently targets NVIDIA GPUs with CUDA and Triton.
 - The backward pass is intentionally conservative for now: Triton forward, eager backward.
+- The mainline keeps the winning fixed-theta squareplus family and drops the losing formula branches from the public CLI.
 - The next major systems win is a fused Triton backward for the causal family path.
 
 ## License

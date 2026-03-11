@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "smooth-attn"
 version = "0.1.0"
-description = "Triton kernels for smooth softplus-family causal attention normalization."
+description = "Triton kernels for smooth squareplus causal attention normalization."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

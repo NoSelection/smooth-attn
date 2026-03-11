@@ -1,8 +1,11 @@
 """
-Production-ready Triton kernels for row-wise and causal softplus-family normalization.
+Production-ready Triton kernels for row-wise and causal squareplus normalization.
 
 The main benchmark entrypoint is centered on the regime that currently looks best:
 causal attention with reusable output buffers and mixed precision.
+
+Legacy `softplus_norm_*` API names are kept for compatibility, but the mainline
+implementation is now the winning squareplus family.
 """
 
 from __future__ import annotations
@@ -83,7 +86,7 @@ class FamilyConfig:
 
     @property
     def label(self):
-        return f"softplus({self.alpha:g} * (x - {self.theta:g}))^{self.power} / sum"
+        return f"squareplus({self.alpha:g} * (x - {self.theta:g}))^{self.power} / sum"
 
 
 @dataclass(frozen=True)
@@ -117,8 +120,6 @@ DEFAULT_FAMILY = FamilyConfig()
 BENCH_ALPHA = DEFAULT_FAMILY.alpha
 BENCH_THETA = DEFAULT_FAMILY.theta
 BENCH_POWER = DEFAULT_FAMILY.power
-
-
 def _current_device_index():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for these Triton kernels")
@@ -247,6 +248,12 @@ def _candidate_configs(block_size):
     return [(4, 2), (8, 2), (8, 4)]
 
 
+def _winner_candidate_configs(seq_len):
+    if seq_len <= 256:
+        return [(2, 2), (2, 4), (4, 2), (4, 4), (8, 2), (8, 4)]
+    return [(4, 2), (4, 4), (8, 2), (8, 4)]
+
+
 def _default_config(block_size):
     if block_size <= 256:
         return 4, 2
@@ -370,6 +377,7 @@ def _tune_launch_config(
     block_size,
     extra_cache_key=(),
     kernel_kwargs=None,
+    candidate_configs=None,
 ):
     device_props = _device_props()
     key = (
@@ -385,7 +393,7 @@ def _tune_launch_config(
 
     out = torch.empty_like(x)
     best = None
-    for num_warps, num_stages in _candidate_configs(block_size):
+    for num_warps, num_stages in (candidate_configs or _candidate_configs(block_size)):
         meta = _get_launch_meta(
             name,
             kernel,
@@ -457,6 +465,18 @@ def _heuristic_launch_config(
 
 
 @triton.jit
+def _apply_family_activation(arg):
+    return 0.5 * (arg + tl.sqrt(arg * arg + 4.0))
+
+
+@triton.jit
+def _apply_winner_squareplus_p2(arg):
+    # squareplus(arg)^2 = 0.25 * (arg + sqrt(arg^2 + 4))^2
+    tmp = arg + tl.sqrt(arg * arg + 4.0)
+    return 0.25 * tmp * tmp
+
+
+@triton.jit
 def _softplus_norm_fwd(
     input_ptr,
     output_ptr,
@@ -480,7 +500,7 @@ def _softplus_norm_fwd(
         x = tl.load(row_ptr, mask=mask, other=0.0).to(tl.float32)
 
         arg = ALPHA * (x - THETA)
-        sp = tl.log(1.0 + tl.exp(arg))
+        sp = _apply_family_activation(arg)
         if POWER == 1:
             y = sp
         elif POWER == 2:
@@ -554,13 +574,47 @@ def _softplus_norm_causal_fwd(
         causal_mask = mask & (col_offsets <= q_pos)
 
         arg = ALPHA * (x - THETA)
-        sp = tl.log(1.0 + tl.exp(arg))
+        sp = _apply_family_activation(arg)
         if POWER == 1:
             y = sp
         elif POWER == 2:
             y = sp * sp
         else:
             y = sp * sp * sp
+        y = tl.where(causal_mask, y, 0.0)
+
+        row_sum = tl.sum(y, axis=0) + 1e-12
+        out = tl.fdiv(y, row_sum)
+
+        out_ptr = output_ptr + row_idx * output_row_stride + col_offsets
+        tl.store(out_ptr, out, mask=mask)
+
+
+@triton.jit
+def _winner_squareplus_p2_causal_small_fwd(
+    input_ptr,
+    output_ptr,
+    n_rows,
+    n_cols,
+    input_row_stride,
+    output_row_stride,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_step = tl.num_programs(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+
+    for row_idx in tl.range(pid, n_rows, row_step, num_stages=NUM_STAGES):
+        row_ptr = input_ptr + row_idx * input_row_stride + col_offsets
+        x = tl.load(row_ptr, mask=mask, other=0.0).to(tl.float32)
+
+        q_pos = row_idx % n_cols
+        causal_mask = mask & (col_offsets <= q_pos)
+
+        arg = x + x - 1.0
+        y = _apply_winner_squareplus_p2(arg)
         y = tl.where(causal_mask, y, 0.0)
 
         row_sum = tl.sum(y, axis=0) + 1e-12
@@ -614,6 +668,7 @@ def _launch_row_kernel_out(
     return_meta=False,
     extra_cache_key=(),
     kernel_kwargs=None,
+    tune_configs=None,
 ):
     n_rows, n_cols = x.shape
     block_size = _pick_block_size(n_cols)
@@ -638,6 +693,7 @@ def _launch_row_kernel_out(
             block_size,
             extra_cache_key=extra_cache_key,
             kernel_kwargs=kernel_kwargs,
+            candidate_configs=tune_configs,
         )
 
     kernel[(launch_meta["num_programs"],)](
@@ -680,6 +736,7 @@ def _launch_attention_kernel_out(
     return_meta=False,
     extra_cache_key=(),
     kernel_kwargs=None,
+    tune_configs=None,
 ):
     seq_len = x.shape[-1]
     x_2d = x.view(-1, seq_len)
@@ -692,6 +749,7 @@ def _launch_attention_kernel_out(
         return_meta=True,
         extra_cache_key=extra_cache_key,
         kernel_kwargs=kernel_kwargs,
+        tune_configs=tune_configs,
     )
     result = result_2d.view_as(out)
     if return_meta:
@@ -752,6 +810,47 @@ def sp2norm_triton(x, return_meta=False):
     return softplus_norm_triton(x, family=DEFAULT_FAMILY, return_meta=return_meta)
 
 
+def _is_winner_family(family):
+    return family.cache_key == DEFAULT_FAMILY.cache_key
+
+
+def _generic_family_causal_triton_out(out, x, family, *, return_meta=False):
+    x_attn = _prepare_attention_input(x)
+    kernel_out, user_out = _prepare_output(out, x_attn)
+    result, meta = _launch_attention_kernel_out(
+        "softplus_norm_causal",
+        _softplus_norm_causal_fwd,
+        x_attn,
+        kernel_out,
+        return_meta=True,
+        extra_cache_key=family.cache_key,
+        kernel_kwargs=family.kernel_kwargs,
+    )
+    result = _finalize_output(result, user_out)
+    if return_meta:
+        return result, meta
+    return result
+
+
+def _winner_squareplus_causal_triton_out(out, x, *, return_meta=False):
+    x_attn = _prepare_attention_input(x)
+    kernel_out, user_out = _prepare_output(out, x_attn)
+    result, meta = _launch_attention_kernel_out(
+        "squareplus_winner_small",
+        _winner_squareplus_p2_causal_small_fwd,
+        x_attn,
+        kernel_out,
+        return_meta=True,
+        extra_cache_key=("winner_squareplus", "small"),
+        tune_configs=_winner_candidate_configs(x_attn.shape[-1]),
+    )
+    result = _finalize_output(result, user_out)
+    meta = {**meta, "variant": "squareplus_winner_small"}
+    if return_meta:
+        return result, meta
+    return result
+
+
 def softmax_triton(x, return_meta=False):
     x_row = _prepare_rowwise_input(x)
     return _launch_row_kernel("softmax", _softmax_fwd, x_row, return_meta=return_meta)
@@ -785,14 +884,11 @@ def softplus_norm_causal_triton(
     family = _resolve_family(alpha, theta, power, family)
     x_attn = _prepare_attention_input(x)
     out = torch.empty_like(x_attn)
-    return _launch_attention_kernel_out(
-        "softplus_norm_causal",
-        _softplus_norm_causal_fwd,
-        x_attn,
+    return softplus_norm_causal_triton_out(
         out,
+        x_attn,
+        family=family,
         return_meta=return_meta,
-        extra_cache_key=family.cache_key,
-        kernel_kwargs=family.kernel_kwargs,
     )
 
 
@@ -808,20 +904,18 @@ def softplus_norm_causal_triton_out(
 ):
     family = _resolve_family(alpha, theta, power, family)
     x_attn = _prepare_attention_input(x)
-    kernel_out, user_out = _prepare_output(out, x_attn)
-    result, meta = _launch_attention_kernel_out(
-        "softplus_norm_causal",
-        _softplus_norm_causal_fwd,
+    if _is_winner_family(family) and x_attn.shape[-1] <= 256:
+        return _winner_squareplus_causal_triton_out(
+            out,
+            x_attn,
+            return_meta=return_meta,
+        )
+    return _generic_family_causal_triton_out(
+        out,
         x_attn,
-        kernel_out,
-        return_meta=True,
-        extra_cache_key=family.cache_key,
-        kernel_kwargs=family.kernel_kwargs,
+        family,
+        return_meta=return_meta,
     )
-    result = _finalize_output(result, user_out)
-    if return_meta:
-        return result, meta
-    return result
 
 
 def softmax_causal_triton(x, return_meta=False):
@@ -852,6 +946,10 @@ def softmax_causal_triton_out(out, x, return_meta=False):
     return result
 
 
+def _apply_family_activation_eager(arg):
+    return 0.5 * (arg + torch.sqrt(arg * arg + 4.0))
+
+
 def softplus_norm_eager(
     x,
     alpha=DEFAULT_FAMILY.alpha,
@@ -861,7 +959,7 @@ def softplus_norm_eager(
     family=None,
 ):
     family = _resolve_family(alpha, theta, power, family)
-    y = F.softplus(family.alpha * (x - family.theta))
+    y = _apply_family_activation_eager(family.alpha * (x - family.theta))
     if family.power == 2:
         y = y * y
     elif family.power == 3:
@@ -879,7 +977,7 @@ def softplus_norm_causal_eager(
 ):
     family = _resolve_family(alpha, theta, power, family)
     mask = _causal_mask(x.shape[-1], x.device)
-    y = F.softplus(family.alpha * (x - family.theta))
+    y = _apply_family_activation_eager(family.alpha * (x - family.theta))
     if family.power == 2:
         y = y * y
     elif family.power == 3:
@@ -896,7 +994,11 @@ def softmax_causal_eager(x):
 class _SoftplusNormCausalAutogradFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, alpha, theta, power):
-        family = FamilyConfig(alpha=float(alpha), theta=float(theta), power=int(power))
+        family = FamilyConfig(
+            alpha=float(alpha),
+            theta=float(theta),
+            power=int(power),
+        )
         x_attn = _prepare_attention_input(x)
         out = torch.empty_like(x_attn)
         result = softplus_norm_causal_triton_out(out, x_attn, family=family)
@@ -1109,13 +1211,16 @@ def _print_header(title):
 
 
 def _print_launch_meta(label, meta):
-    print(
-        f"  {label}:"
-        f" BLOCK={meta['block_size']}"
-        f" warps={meta['num_warps']}"
-        f" stages={meta['num_stages']}"
-        f" progs={meta['num_programs']}"
-    )
+    parts = [
+        f"  {label}:",
+        f"BLOCK={meta['block_size']}",
+        f"warps={meta['num_warps']}",
+        f"stages={meta['num_stages']}",
+        f"progs={meta['num_programs']}",
+    ]
+    if "variant" in meta:
+        parts.append(f"variant={meta['variant']}")
+    print(" ".join(parts))
 
 
 def print_rowwise_report(results):
@@ -1188,7 +1293,7 @@ def print_causal_report(results, family):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Triton softplus-family benchmark harness")
+    parser = argparse.ArgumentParser(description="Triton squareplus benchmark harness")
     parser.add_argument("--mode", choices=("causal", "rowwise", "all"), default="causal")
     parser.add_argument("--dtypes", default="bf16", help="comma-separated: fp32,fp16,bf16")
     parser.add_argument("--lengths", default="128,256,512,1024", help="comma-separated causal sequence lengths")
@@ -1206,7 +1311,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    family = FamilyConfig(alpha=args.alpha, theta=args.theta, power=args.power)
+    family = FamilyConfig(
+        alpha=args.alpha,
+        theta=args.theta,
+        power=args.power,
+    )
     dtypes = _parse_dtype_list(args.dtypes)
     lengths = _parse_int_list(args.lengths)
 
@@ -1215,7 +1324,7 @@ def main():
         args.warmup = min(args.warmup, 20)
         args.iters = min(args.iters, 100)
 
-    _print_header("TRITON SOFTPLUS-FAMILY BENCHMARK")
+    _print_header("TRITON SQUAREPLUS BENCHMARK")
     print(f"GPU: {torch.cuda.get_device_name(_current_device_index())}")
     print(f"Family: {family.label}")
 
