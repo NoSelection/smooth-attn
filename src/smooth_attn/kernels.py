@@ -2638,6 +2638,162 @@ def sp2norm_fp8_flash_attention(q, k, v, *, scale=None, window_size=0):
     return o
 
 
+# ---------------------------------------------------------------------------
+# Paged KV-cache Attention — vLLM-style inference with non-contiguous pages.
+# Decode phase: single query token per sequence attending to all cached KV.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _sp2norm_paged_attention_kernel(
+    Q_ptr,          # [batch, H_q, 1, D]
+    K_cache_ptr,    # [num_blocks, H_kv, block_size, D]
+    V_cache_ptr,    # [num_blocks, H_kv, block_size, D]
+    O_ptr,          # [batch, H_q, D]
+    BlockTable_ptr, # [batch, max_blocks_per_seq] — logical-to-physical
+    CtxLens_ptr,    # [batch] — actual KV length per sequence
+    scale,
+    n_kv_groups,
+    block_size,     # tokens per KV page
+    max_blocks_per_seq,
+    stride_qb, stride_qh, stride_qs, stride_qd,
+    stride_kb, stride_kh, stride_ks, stride_kd,
+    stride_vb, stride_vh, stride_vs, stride_vd,
+    stride_ob, stride_oh, stride_od,
+    stride_btb, stride_bts,
+    D_HEAD: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # must match block_size
+):
+    """Paged sp2norm attention for decode (single query token).
+
+    Each program handles one (batch, head) pair. Iterates over all KV cache
+    pages for this sequence using the block table for indirection.
+    """
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    kv_head_idx = head_idx // n_kv_groups
+
+    # Load context length for this sequence
+    ctx_len = tl.load(CtxLens_ptr + batch_idx)
+
+    # Load query: [1, D] -> [D]
+    d_offs = tl.arange(0, D_HEAD)
+    q_base = Q_ptr + batch_idx * stride_qb + head_idx * stride_qh
+    q = tl.load(q_base + 0 * stride_qs + d_offs * stride_qd,
+                mask=d_offs < D_HEAD, other=0.0).to(tl.float32)  # [D]
+
+    # Accumulators
+    o_acc = tl.zeros([D_HEAD], dtype=tl.float32)
+    s_acc = tl.full([1], 1e-12, dtype=tl.float32)
+
+    # Number of blocks this sequence uses
+    num_blocks = (ctx_len + block_size - 1) // block_size
+
+    # Iterate over KV cache pages
+    s_offs = tl.arange(0, BLOCK_SIZE)  # [BLOCK_SIZE]
+
+    for block_idx in range(0, max_blocks_per_seq):
+        # Skip blocks beyond this sequence's actual length
+        if block_idx < num_blocks:
+            # Look up physical block from block table
+            phys_block = tl.load(BlockTable_ptr + batch_idx * stride_btb + block_idx * stride_bts)
+
+            # Token positions within this block
+            token_start = block_idx * block_size
+            token_offs = token_start + s_offs  # [BLOCK_SIZE]
+            token_mask = token_offs < ctx_len  # [BLOCK_SIZE]
+
+            # Load K from paged cache: [BLOCK_SIZE, D]
+            k_base = K_cache_ptr + phys_block * stride_kb + kv_head_idx * stride_kh
+            k_ptrs = k_base + s_offs[:, None] * stride_ks + d_offs[None, :] * stride_kd
+            k = tl.load(k_ptrs, mask=token_mask[:, None], other=0.0)  # [BLOCK_SIZE, D]
+
+            # Score: q @ k^T -> [BLOCK_SIZE]
+            scores = tl.sum(q[None, :] * k.to(tl.float32), axis=1) * scale  # [BLOCK_SIZE]
+
+            # sp2norm activation: squareplus(2*scores - 1)^2
+            x = 2.0 * scores - 1.0
+            sp = 0.5 * (x + tl.sqrt(x * x + 4.0))  # softplus / squareplus
+            y = sp * sp  # ^2
+
+            # Mask out padding tokens
+            y = tl.where(token_mask, y, 0.0)
+
+            # Accumulate row sum
+            s_acc += tl.sum(y, axis=0)[None]
+
+            # Load V from paged cache: [BLOCK_SIZE, D]
+            v_base = V_cache_ptr + phys_block * stride_vb + kv_head_idx * stride_vh
+            v_ptrs = v_base + s_offs[:, None] * stride_vs + d_offs[None, :] * stride_vd
+            v = tl.load(v_ptrs, mask=token_mask[:, None], other=0.0)  # [BLOCK_SIZE, D]
+
+            # Weighted V accumulation
+            o_acc += tl.sum(y[:, None] * v.to(tl.float32), axis=0)  # [D]
+
+    # Normalize
+    o = o_acc / s_acc
+
+    # Store output: [D]
+    o_base = O_ptr + batch_idx * stride_ob + head_idx * stride_oh
+    o_ptrs = o_base + d_offs * stride_od
+    tl.store(o_ptrs, o.to(tl.bfloat16), mask=d_offs < D_HEAD)
+
+
+def sp2norm_paged_attention(q, k_cache, v_cache, block_table, context_lens,
+                            *, scale=None, block_size=16):
+    """Paged KV-cache sp2norm attention for autoregressive decode.
+
+    This kernel supports vLLM-style non-contiguous KV cache pages, enabling
+    efficient memory management for inference serving with dynamic batching.
+
+    Args:
+        q: [batch, H_q, 1, D] — single query token per sequence
+        k_cache: [num_blocks, H_kv, block_size, D] — paged key cache
+        v_cache: [num_blocks, H_kv, block_size, D] — paged value cache
+        block_table: [batch, max_blocks_per_seq] — logical-to-physical block mapping (int32)
+        context_lens: [batch] — actual KV length per sequence (int32)
+        scale: score scaling (default: 1/sqrt(D))
+        block_size: tokens per cache page (default: 16, must match k_cache/v_cache dim 2)
+
+    Returns:
+        output: [batch, H_q, D] — attention output (BF16)
+    """
+    assert q.ndim == 4 and q.shape[2] == 1, "Decode: q must be [B, H, 1, D]"
+    B, H_q, _, D = q.shape
+    H_kv = k_cache.shape[1]
+    assert H_q % H_kv == 0
+    assert k_cache.shape[2] == block_size and v_cache.shape[2] == block_size
+    max_blocks_per_seq = block_table.shape[1]
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(D)
+
+    n_kv_groups = H_q // H_kv
+    q = q.contiguous()
+    k_cache = k_cache.contiguous()
+    v_cache = v_cache.contiguous()
+    block_table = block_table.contiguous()
+    context_lens = context_lens.contiguous()
+
+    out = torch.empty(B, H_q, D, device=q.device, dtype=torch.bfloat16)
+
+    D_HEAD = triton.next_power_of_2(D)
+    BLOCK_SIZE = triton.next_power_of_2(block_size)
+
+    grid = (B, H_q)
+
+    _sp2norm_paged_attention_kernel[grid](
+        q, k_cache, v_cache, out, block_table, context_lens,
+        scale, n_kv_groups, block_size, max_blocks_per_seq,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
+        out.stride(0), out.stride(1), out.stride(2),
+        block_table.stride(0), block_table.stride(1),
+        D_HEAD=D_HEAD, BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+
 def bench(fn, x=None, warmup=300, iters=1000):
     callback = (lambda: fn(x)) if x is not None else fn
     return _median_cuda_us(callback, warmup=warmup, iters=iters)
