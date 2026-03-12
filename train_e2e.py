@@ -21,9 +21,11 @@ import sys
 sys.stdout.reconfigure(line_buffering=True)
 sys.path.insert(0, "src")
 
-from smooth_attn import sp2norm_flash_attention
+from smooth_attn import DEFAULT_FAMILY, softplus_norm_causal_eager, sp2norm_flash_attention
 
 DEVICE = 'cuda'
+ATTN_DROPOUT = 0.0
+RESID_DROPOUT = 0.1
 
 # ============================================================
 # Data
@@ -66,10 +68,8 @@ def attn_softmax(wei, mask):
 
 def attn_sp2norm_eager(wei, mask):
     """sp2norm: squareplus(2*scores - 1)^2 / sum. Eager (materialized T×T)."""
-    y = F.softplus(2.0 * (wei - 0.5))
-    y = y * y
-    y = y.masked_fill(mask, 0.0)
-    return y / (y.sum(dim=-1, keepdim=True) + 1e-12)
+    del mask
+    return softplus_norm_causal_eager(wei.float(), family=DEFAULT_FAMILY)
 
 
 # ============================================================
@@ -78,15 +78,24 @@ def attn_sp2norm_eager(wei, mask):
 
 class MHA_Eager(nn.Module):
     """Multi-head attention with materialized score matrix."""
-    def __init__(self, n_embd, n_head, max_ctx, attn_fn, dropout=0.1):
+    def __init__(
+        self,
+        n_embd,
+        n_head,
+        max_ctx,
+        attn_fn,
+        *,
+        attn_dropout=ATTN_DROPOUT,
+        proj_dropout=RESID_DROPOUT,
+    ):
         super().__init__()
         self.n_head = n_head
         self.hs = n_embd // n_head
         self.attn_fn = attn_fn
         self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
         self.proj = nn.Linear(n_embd, n_embd)
-        self.attn_drop = nn.Dropout(dropout)
-        self.proj_drop = nn.Dropout(dropout)
+        self.attn_drop = nn.Dropout(attn_dropout)
+        self.proj_drop = nn.Dropout(proj_dropout)
         self.register_buffer('tril', torch.tril(torch.ones(max_ctx, max_ctx)))
         self.last_attn_weights = None
 
@@ -115,14 +124,23 @@ class MHA_Eager(nn.Module):
 class MHA_Fused(nn.Module):
     """Multi-head attention using sp2norm_flash_attention Triton kernel.
     No T×T matrix ever materialized. Causal mask built into kernel."""
-    def __init__(self, n_embd, n_head, max_ctx, dropout=0.1):
+    def __init__(
+        self,
+        n_embd,
+        n_head,
+        max_ctx,
+        *,
+        attn_dropout=ATTN_DROPOUT,
+        proj_dropout=RESID_DROPOUT,
+    ):
         super().__init__()
+        if attn_dropout != 0.0:
+            raise ValueError("sp2norm_fused comparison expects attention dropout to be disabled")
         self.n_head = n_head
         self.hs = n_embd // n_head
         self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
         self.proj = nn.Linear(n_embd, n_embd)
-        self.attn_drop = nn.Dropout(dropout)
-        self.proj_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(proj_dropout)
         self.last_attn_weights = None
 
     def forward(self, x, capture=False):
@@ -146,20 +164,20 @@ class MHA_Fused(nn.Module):
         if capture:
             self.last_attn_weights = None
 
-        out = self.attn_drop(out)
         out = out.transpose(1, 2).reshape(B, T, C)
         return self.proj_drop(self.proj(out))
 
 
 def build_model(variant, n_embd, n_head, n_layer, max_ctx):
     """Build GPT with specified attention variant."""
+    mha_kwargs = {"attn_dropout": ATTN_DROPOUT, "proj_dropout": RESID_DROPOUT}
 
     if variant == 'softmax':
-        mha_fn = lambda: MHA_Eager(n_embd, n_head, max_ctx, attn_softmax)
+        mha_fn = lambda: MHA_Eager(n_embd, n_head, max_ctx, attn_softmax, **mha_kwargs)
     elif variant == 'sp2norm_eager':
-        mha_fn = lambda: MHA_Eager(n_embd, n_head, max_ctx, attn_sp2norm_eager)
+        mha_fn = lambda: MHA_Eager(n_embd, n_head, max_ctx, attn_sp2norm_eager, **mha_kwargs)
     elif variant == 'sp2norm_fused':
-        mha_fn = lambda: MHA_Fused(n_embd, n_head, max_ctx)
+        mha_fn = lambda: MHA_Fused(n_embd, n_head, max_ctx, **mha_kwargs)
     else:
         raise ValueError(f"Unknown variant: {variant}")
 
@@ -169,7 +187,7 @@ def build_model(variant, n_embd, n_head, n_layer, max_ctx):
             self.sa = mha_fn()
             self.ffwd = nn.Sequential(
                 nn.Linear(n_embd, 4 * n_embd), nn.ReLU(),
-                nn.Linear(4 * n_embd, n_embd), nn.Dropout(0.1),
+                nn.Linear(4 * n_embd, n_embd), nn.Dropout(RESID_DROPOUT),
             )
             self.ln1 = nn.LayerNorm(n_embd)
             self.ln2 = nn.LayerNorm(n_embd)
