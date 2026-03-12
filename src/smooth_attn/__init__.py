@@ -27,6 +27,9 @@ from .kernels import (
     sp2norm_flash_attention,
     sp2norm_flash_attention_eager,
     sp2norm_fp8_flash_attention,
+    sp2norm_rope_flash_attention,
+    sp2norm_rope_flash_attention_proj,
+    precompute_rope_cos_sin,
     sp2norm_triton,
 )
 
@@ -59,5 +62,8 @@ __all__ = [
     "sp2norm_flash_attention",
     "sp2norm_flash_attention_eager",
     "sp2norm_fp8_flash_attention",
+    "sp2norm_rope_flash_attention",
+    "sp2norm_rope_flash_attention_proj",
+    "precompute_rope_cos_sin",
     "sp2norm_triton",
 ]

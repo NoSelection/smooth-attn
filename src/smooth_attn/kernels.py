@@ -2050,6 +2050,412 @@ def sp2norm_flash_attention_eager(q, k, v, *, scale=None, window_size=0):
 
 
 # ---------------------------------------------------------------------------
+# Fused RoPE + Flash Attention — apply rotary embeddings in-register.
+# Eliminates a full Q/K global memory round-trip.
+# ---------------------------------------------------------------------------
+
+
+def precompute_rope_cos_sin(dim, seq_len, base=10000.0, device="cuda", dtype=torch.float32):
+    """Precompute cos/sin tables for RoPE. Shape: [T, D/2] each.
+
+    Usage: call once at model init, reuse across all forward passes.
+    """
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    t = torch.arange(seq_len, device=device, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)  # [T, D/2]
+    return freqs.cos().to(dtype), freqs.sin().to(dtype)
+
+
+@triton.jit
+def _sp2norm_rope_flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr, RowSum_ptr,
+    Cos_ptr, Sin_ptr,
+    seq_len, scale,
+    n_kv_groups, window_size,
+    stride_qz, stride_qh, stride_qs, stride_qd,
+    stride_kz, stride_kh, stride_ks, stride_kd,
+    stride_vz, stride_vh, stride_vs, stride_vd,
+    stride_oz, stride_oh, stride_os, stride_od,
+    stride_rsz, stride_rsh, stride_rss,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    D_HEAD: tl.constexpr,
+    D_HALF: tl.constexpr,
+):
+    """Flash attention forward with fused RoPE. No separate RoPE kernel needed.
+
+    Q/K are loaded un-rotated, RoPE is applied in-register using the identity:
+    Q_rot · K_rot^T = dot(q_a_rot, k_a_rot^T) + dot(q_b_rot, k_b_rot^T)
+    where a = first half, b = second half of head dimension.
+    """
+    q_block_idx = tl.program_id(0)
+    bh_idx = tl.program_id(1)
+    kv_bh_idx = bh_idx // n_kv_groups
+
+    q_start = q_block_idx * BLOCK_Q
+    q_offs = q_start + tl.arange(0, BLOCK_Q)
+    d_first = tl.arange(0, D_HALF)          # [0, ..., D/2-1]
+    d_second = d_first + D_HALF              # [D/2, ..., D-1]
+    d_full = tl.arange(0, D_HEAD)
+    kv_offs_base = tl.arange(0, BLOCK_KV)
+
+    q_base = Q_ptr + bh_idx * stride_qh
+    k_base = K_ptr + kv_bh_idx * stride_kh
+    v_base = V_ptr + kv_bh_idx * stride_vh
+
+    q_mask_1d = q_offs < seq_len
+    q_mask = q_offs[:, None] < seq_len
+
+    # Load Q as two halves (un-rotated)
+    q_a = tl.load(q_base + q_offs[:, None] * stride_qs + d_first[None, :] * stride_qd,
+                  mask=q_mask, other=0.0).to(tl.float32)
+    q_b = tl.load(q_base + q_offs[:, None] * stride_qs + d_second[None, :] * stride_qd,
+                  mask=q_mask, other=0.0).to(tl.float32)
+
+    # Load cos/sin for Q positions — shape [BLOCK_Q, D/2]
+    cos_q = tl.load(Cos_ptr + q_offs[:, None] * D_HALF + d_first[None, :],
+                    mask=q_mask, other=1.0).to(tl.float32)
+    sin_q = tl.load(Sin_ptr + q_offs[:, None] * D_HALF + d_first[None, :],
+                    mask=q_mask, other=0.0).to(tl.float32)
+
+    # Apply RoPE to Q in-register
+    q_ra = (q_a * cos_q - q_b * sin_q).to(tl.bfloat16)
+    q_rb = (q_b * cos_q + q_a * sin_q).to(tl.bfloat16)
+
+    o_acc = tl.zeros([BLOCK_Q, D_HEAD], dtype=tl.float32)
+    s_acc = tl.full([BLOCK_Q], 1e-12, dtype=tl.float32)
+
+    max_kv_block = tl.cdiv(q_start + BLOCK_Q, BLOCK_KV)
+    num_kv_blocks = tl.cdiv(seq_len, BLOCK_KV)
+    end_kv = tl.minimum(max_kv_block, num_kv_blocks)
+
+    if window_size > 0:
+        window_start_pos = tl.maximum(0, q_start - window_size + 1)
+        start_kv = window_start_pos // BLOCK_KV
+    else:
+        start_kv = 0
+
+    for kv_block_idx in tl.range(start_kv, end_kv):
+        kv_start = kv_block_idx * BLOCK_KV
+        kv_offs = kv_start + kv_offs_base
+        kv_mask = kv_offs[:, None] < seq_len
+
+        # Load K as two halves (un-rotated)
+        k_a = tl.load(k_base + kv_offs[:, None] * stride_ks + d_first[None, :] * stride_kd,
+                      mask=kv_mask, other=0.0).to(tl.float32)
+        k_b = tl.load(k_base + kv_offs[:, None] * stride_ks + d_second[None, :] * stride_kd,
+                      mask=kv_mask, other=0.0).to(tl.float32)
+
+        # Load cos/sin for K positions
+        cos_k = tl.load(Cos_ptr + kv_offs[:, None] * D_HALF + d_first[None, :],
+                        mask=kv_mask, other=1.0).to(tl.float32)
+        sin_k = tl.load(Sin_ptr + kv_offs[:, None] * D_HALF + d_first[None, :],
+                        mask=kv_mask, other=0.0).to(tl.float32)
+
+        # Apply RoPE to K in-register
+        k_ra = (k_a * cos_k - k_b * sin_k).to(tl.bfloat16)
+        k_rb = (k_b * cos_k + k_a * sin_k).to(tl.bfloat16)
+
+        # QK^T via split-dimension dot: Q_rot · K_rot^T = qa·ka^T + qb·kb^T
+        scores = (tl.dot(q_ra, tl.trans(k_ra)) + tl.dot(q_rb, tl.trans(k_rb))).to(tl.float32) * scale
+
+        causal_mask = kv_offs[None, :] <= q_offs[:, None]
+        if window_size > 0:
+            window_mask = kv_offs[None, :] > (q_offs[:, None] - window_size)
+            causal_mask = causal_mask & window_mask
+        valid_mask = causal_mask & (kv_offs[None, :] < seq_len) & (q_offs[:, None] < seq_len)
+
+        # sp2norm activation in FP32
+        arg = scores + scores - 1.0
+        s = arg * arg + 4.0
+        tmp = arg + _fast_sqrt(s)
+        y = 0.25 * tmp * tmp
+        y = tl.where(valid_mask, y, 0.0)
+
+        s_acc += tl.sum(y, axis=1)
+
+        # V does NOT get RoPE — load full D_HEAD
+        v_ptrs = v_base + kv_offs[:, None] * stride_vs + d_full[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
+        o_acc += tl.dot(y.to(v.dtype), v).to(tl.float32)
+
+    o = o_acc / s_acc[:, None]
+
+    o_base = O_ptr + bh_idx * stride_oh
+    o_ptrs = o_base + q_offs[:, None] * stride_os + d_full[None, :] * stride_od
+    tl.store(o_ptrs, o.to(tl.bfloat16), mask=q_mask)
+
+    rs_base = RowSum_ptr + bh_idx * stride_rsh
+    tl.store(rs_base + q_offs * stride_rss, s_acc, mask=q_mask_1d)
+
+
+# ---------------------------------------------------------------------------
+# Fused Attention + Output Projection — skip writing [B,H,T,D], write
+# [B,T,D_model] directly by multiplying by W_o inside the kernel.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _sp2norm_rope_flash_proj_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr, Wo_ptr, Out_ptr, RowSum_ptr,
+    Cos_ptr, Sin_ptr,
+    seq_len, scale,
+    n_kv_groups, window_size,
+    n_heads, d_model,
+    stride_qz, stride_qh, stride_qs, stride_qd,
+    stride_kz, stride_kh, stride_ks, stride_kd,
+    stride_vz, stride_vh, stride_vs, stride_vd,
+    stride_wh, stride_wd, stride_wm,
+    stride_oz, stride_os, stride_om,
+    stride_rsz, stride_rsh, stride_rss,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    D_HEAD: tl.constexpr,
+    D_HALF: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+):
+    """Flash attention + RoPE + output projection.
+
+    Instead of writing [B,H,T,D] attention output, multiplies by W_o[h]
+    and atomically accumulates into [B,T,D_model] directly.
+    W_o shape: [H, D, D_model] (pre-reshaped from [H*D, D_model]).
+    """
+    q_block_idx = tl.program_id(0)
+    bh_idx = tl.program_id(1)
+    kv_bh_idx = bh_idx // n_kv_groups
+
+    # Extract batch and head indices
+    batch_idx = bh_idx // n_heads
+    head_idx = bh_idx % n_heads
+
+    q_start = q_block_idx * BLOCK_Q
+    q_offs = q_start + tl.arange(0, BLOCK_Q)
+    d_first = tl.arange(0, D_HALF)
+    d_second = d_first + D_HALF
+    d_full = tl.arange(0, D_HEAD)
+    kv_offs_base = tl.arange(0, BLOCK_KV)
+
+    q_base = Q_ptr + bh_idx * stride_qh
+    k_base = K_ptr + kv_bh_idx * stride_kh
+    v_base = V_ptr + kv_bh_idx * stride_vh
+
+    q_mask_1d = q_offs < seq_len
+    q_mask = q_offs[:, None] < seq_len
+
+    # Load Q halves + RoPE
+    q_a = tl.load(q_base + q_offs[:, None] * stride_qs + d_first[None, :] * stride_qd,
+                  mask=q_mask, other=0.0).to(tl.float32)
+    q_b = tl.load(q_base + q_offs[:, None] * stride_qs + d_second[None, :] * stride_qd,
+                  mask=q_mask, other=0.0).to(tl.float32)
+    cos_q = tl.load(Cos_ptr + q_offs[:, None] * D_HALF + d_first[None, :],
+                    mask=q_mask, other=1.0).to(tl.float32)
+    sin_q = tl.load(Sin_ptr + q_offs[:, None] * D_HALF + d_first[None, :],
+                    mask=q_mask, other=0.0).to(tl.float32)
+    q_ra = (q_a * cos_q - q_b * sin_q).to(tl.bfloat16)
+    q_rb = (q_b * cos_q + q_a * sin_q).to(tl.bfloat16)
+
+    o_acc = tl.zeros([BLOCK_Q, D_HEAD], dtype=tl.float32)
+    s_acc = tl.full([BLOCK_Q], 1e-12, dtype=tl.float32)
+
+    max_kv_block = tl.cdiv(q_start + BLOCK_Q, BLOCK_KV)
+    num_kv_blocks = tl.cdiv(seq_len, BLOCK_KV)
+    end_kv = tl.minimum(max_kv_block, num_kv_blocks)
+
+    if window_size > 0:
+        window_start_pos = tl.maximum(0, q_start - window_size + 1)
+        start_kv = window_start_pos // BLOCK_KV
+    else:
+        start_kv = 0
+
+    for kv_block_idx in tl.range(start_kv, end_kv):
+        kv_start = kv_block_idx * BLOCK_KV
+        kv_offs = kv_start + kv_offs_base
+        kv_mask = kv_offs[:, None] < seq_len
+
+        k_a = tl.load(k_base + kv_offs[:, None] * stride_ks + d_first[None, :] * stride_kd,
+                      mask=kv_mask, other=0.0).to(tl.float32)
+        k_b = tl.load(k_base + kv_offs[:, None] * stride_ks + d_second[None, :] * stride_kd,
+                      mask=kv_mask, other=0.0).to(tl.float32)
+        cos_k = tl.load(Cos_ptr + kv_offs[:, None] * D_HALF + d_first[None, :],
+                        mask=kv_mask, other=1.0).to(tl.float32)
+        sin_k = tl.load(Sin_ptr + kv_offs[:, None] * D_HALF + d_first[None, :],
+                        mask=kv_mask, other=0.0).to(tl.float32)
+        k_ra = (k_a * cos_k - k_b * sin_k).to(tl.bfloat16)
+        k_rb = (k_b * cos_k + k_a * sin_k).to(tl.bfloat16)
+
+        scores = (tl.dot(q_ra, tl.trans(k_ra)) + tl.dot(q_rb, tl.trans(k_rb))).to(tl.float32) * scale
+
+        causal_mask = kv_offs[None, :] <= q_offs[:, None]
+        if window_size > 0:
+            window_mask = kv_offs[None, :] > (q_offs[:, None] - window_size)
+            causal_mask = causal_mask & window_mask
+        valid_mask = causal_mask & (kv_offs[None, :] < seq_len) & (q_offs[:, None] < seq_len)
+
+        arg = scores + scores - 1.0
+        s = arg * arg + 4.0
+        tmp = arg + _fast_sqrt(s)
+        y = 0.25 * tmp * tmp
+        y = tl.where(valid_mask, y, 0.0)
+        s_acc += tl.sum(y, axis=1)
+
+        v_ptrs = v_base + kv_offs[:, None] * stride_vs + d_full[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
+        o_acc += tl.dot(y.to(v.dtype), v).to(tl.float32)
+
+    # Normalize: [BLOCK_Q, D_HEAD]
+    o_head = o_acc / s_acc[:, None]
+
+    # Save row_sums for potential backward use
+    rs_base = RowSum_ptr + bh_idx * stride_rsh
+    tl.store(rs_base + q_offs * stride_rss, s_acc, mask=q_mask_1d)
+
+    # Output projection: o_head [BLOCK_Q, D] @ W_o[head] [D, D_model] → [BLOCK_Q, D_model]
+    # Then atomically accumulate into Out[batch, q_pos, :d_model]
+    # W_o layout: [H, D, D_model]
+    w_base = Wo_ptr + head_idx * stride_wh
+    dm_offs = tl.arange(0, BLOCK_DMODEL)
+
+    # Tile over D_model in blocks
+    o_head_bf16 = o_head.to(tl.bfloat16)
+    for dm_start in tl.range(0, d_model, BLOCK_DMODEL):
+        dm = dm_start + dm_offs
+        dm_mask = dm[None, :] < d_model
+
+        # Load W_o slice: [D_HEAD, BLOCK_DMODEL]
+        w = tl.load(w_base + d_full[:, None] * stride_wd + dm[None, :] * stride_wm,
+                    mask=dm_mask, other=0.0)
+
+        # Projected output: [BLOCK_Q, BLOCK_DMODEL]
+        proj = tl.dot(o_head_bf16, w).to(tl.float32)
+
+        # Atomic accumulate into Out[batch, q_pos, dm]
+        out_base = Out_ptr + batch_idx * stride_oz
+        out_ptrs = out_base + q_offs[:, None] * stride_os + dm[None, :] * stride_om
+        out_mask = q_mask & dm_mask
+        tl.atomic_add(out_ptrs, proj.to(tl.bfloat16), mask=out_mask)
+
+
+def sp2norm_rope_flash_attention(q, k, v, cos, sin, *, scale=None, window_size=0):
+    """Fused RoPE + sp2norm flash attention — no separate RoPE kernel needed.
+
+    Q and K are loaded un-rotated. RoPE is applied in-register, saving a full
+    global memory round-trip of Q and K.
+
+    Args:
+        q: [B, H_q, T, D] query tensor (un-rotated BF16)
+        k: [B, H_kv, T, D] key tensor (un-rotated BF16)
+        v: [B, H_kv, T, D] value tensor (BF16)
+        cos: [T, D/2] cosine table from precompute_rope_cos_sin
+        sin: [T, D/2] sine table from precompute_rope_cos_sin
+        scale: score scaling factor (default: 1/sqrt(D))
+        window_size: sliding window size (0 = full causal)
+
+    Returns:
+        output: [B, H_q, T, D] attention output (BF16)
+    """
+    assert q.ndim == 4 and k.ndim == 4 and v.ndim == 4
+    B, H_q, T, D = q.shape
+    H_kv = k.shape[1]
+    assert H_q % H_kv == 0
+    assert D % 2 == 0
+    assert cos.shape == (T, D // 2) and sin.shape == (T, D // 2)
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(D)
+
+    n_kv_groups = H_q // H_kv
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    cos, sin = cos.contiguous(), sin.contiguous()
+
+    o = torch.empty_like(q)
+    row_sums = torch.empty(B, H_q, T, device=q.device, dtype=torch.float32)
+
+    D_HEAD = triton.next_power_of_2(D)
+    D_HALF = D_HEAD // 2
+    # Reduce block sizes for large D to avoid shared memory overflow
+    max_block = 64 if D_HEAD <= 64 else 32
+    BLOCK_Q = min(max_block, triton.next_power_of_2(T))
+    BLOCK_KV = min(max_block, triton.next_power_of_2(T))
+    grid = (triton.cdiv(T, BLOCK_Q), B * H_q)
+
+    _sp2norm_rope_flash_fwd_kernel[grid](
+        q, k, v, o, row_sums, cos, sin,
+        T, scale, n_kv_groups, window_size,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        row_sums.stride(0), row_sums.stride(1), row_sums.stride(2),
+        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, D_HEAD=D_HEAD, D_HALF=D_HALF,
+    )
+    return o
+
+
+def sp2norm_rope_flash_attention_proj(q, k, v, w_o, cos, sin, *, scale=None, window_size=0):
+    """Fused RoPE + sp2norm flash attention + output projection.
+
+    Combines three operations into one kernel launch:
+    1. RoPE on Q/K (in-register)
+    2. sp2norm flash attention
+    3. Output projection by W_o — writes [B, T, D_model] directly
+
+    Args:
+        q: [B, H_q, T, D] query tensor (un-rotated BF16)
+        k: [B, H_kv, T, D] key tensor (un-rotated BF16)
+        v: [B, H_kv, T, D] value tensor (BF16)
+        w_o: [H_q, D, D_model] output projection weight (pre-reshaped)
+        cos: [T, D/2] cosine table
+        sin: [T, D/2] sine table
+        scale: score scaling factor (default: 1/sqrt(D))
+        window_size: sliding window size (0 = full causal)
+
+    Returns:
+        output: [B, T, D_model] projected output (BF16)
+    """
+    assert q.ndim == 4 and k.ndim == 4 and v.ndim == 4
+    B, H_q, T, D = q.shape
+    H_kv = k.shape[1]
+    assert H_q % H_kv == 0
+    assert D % 2 == 0
+    assert w_o.shape[0] == H_q and w_o.shape[1] == D
+    D_model = w_o.shape[2]
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(D)
+
+    n_kv_groups = H_q // H_kv
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    w_o = w_o.contiguous()
+    cos, sin = cos.contiguous(), sin.contiguous()
+
+    # Output: [B, T, D_model] — zero-init for atomic accumulation across heads
+    out = torch.zeros(B, T, D_model, device=q.device, dtype=torch.bfloat16)
+    row_sums = torch.empty(B, H_q, T, device=q.device, dtype=torch.float32)
+
+    D_HEAD = triton.next_power_of_2(D)
+    D_HALF = D_HEAD // 2
+    max_block = 64 if D_HEAD <= 64 else 32
+    BLOCK_Q = min(max_block, triton.next_power_of_2(T))
+    BLOCK_KV = min(max_block, triton.next_power_of_2(T))
+    BLOCK_DMODEL = min(64, triton.next_power_of_2(D_model))
+    grid = (triton.cdiv(T, BLOCK_Q), B * H_q)
+
+    _sp2norm_rope_flash_proj_fwd_kernel[grid](
+        q, k, v, w_o, out, row_sums, cos, sin,
+        T, scale, n_kv_groups, window_size, H_q, D_model,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        w_o.stride(0), w_o.stride(1), w_o.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        row_sums.stride(0), row_sums.stride(1), row_sums.stride(2),
+        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, D_HEAD=D_HEAD,
+        D_HALF=D_HALF, BLOCK_DMODEL=BLOCK_DMODEL,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # FP8 Flash Attention — only possible with sp2norm (polynomial, bounded).
 # Softmax's exp() would overflow in FP8 E4M3 range [-448, 448].
 # ---------------------------------------------------------------------------
