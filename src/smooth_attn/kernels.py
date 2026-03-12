@@ -251,7 +251,7 @@ def _candidate_configs(block_size):
 def _winner_candidate_configs(seq_len):
     if seq_len <= 256:
         return [(2, 2), (2, 4), (4, 2), (4, 4), (8, 2), (8, 4)]
-    return [(4, 2), (4, 4), (8, 2), (8, 4)]
+    return [(2, 2), (2, 4), (4, 2), (4, 4), (8, 2), (8, 4)]
 
 
 def _default_config(block_size):
@@ -465,14 +465,22 @@ def _heuristic_launch_config(
 
 
 @triton.jit
+def _fast_sqrt(x):
+    # rsqrt is a single-cycle SFU instruction on NVIDIA; sqrt(x) = x * rsqrt(x)
+    return x * tl.rsqrt(x)
+
+
+@triton.jit
 def _apply_family_activation(arg):
-    return 0.5 * (arg + tl.sqrt(arg * arg + 4.0))
+    s = arg * arg + 4.0
+    return 0.5 * (arg + _fast_sqrt(s))
 
 
 @triton.jit
 def _apply_winner_squareplus_p2(arg):
     # squareplus(arg)^2 = 0.25 * (arg + sqrt(arg^2 + 4))^2
-    tmp = arg + tl.sqrt(arg * arg + 4.0)
+    s = arg * arg + 4.0
+    tmp = arg + _fast_sqrt(s)
     return 0.25 * tmp * tmp
 
 
@@ -567,11 +575,10 @@ def _softplus_norm_causal_fwd(
     mask = col_offsets < n_cols
 
     for row_idx in tl.range(pid, n_rows, row_step, num_stages=NUM_STAGES):
-        row_ptr = input_ptr + row_idx * input_row_stride + col_offsets
-        x = tl.load(row_ptr, mask=mask, other=0.0).to(tl.float32)
-
         q_pos = row_idx % n_cols
         causal_mask = mask & (col_offsets <= q_pos)
+        row_ptr = input_ptr + row_idx * input_row_stride + col_offsets
+        x = tl.load(row_ptr, mask=causal_mask, other=0.0).to(tl.float32)
 
         arg = ALPHA * (x - THETA)
         sp = _apply_family_activation(arg)
@@ -591,7 +598,7 @@ def _softplus_norm_causal_fwd(
 
 
 @triton.jit
-def _winner_squareplus_p2_causal_small_fwd(
+def _winner_squareplus_p2_causal_fwd(
     input_ptr,
     output_ptr,
     n_rows,
@@ -607,11 +614,10 @@ def _winner_squareplus_p2_causal_small_fwd(
     mask = col_offsets < n_cols
 
     for row_idx in tl.range(pid, n_rows, row_step, num_stages=NUM_STAGES):
-        row_ptr = input_ptr + row_idx * input_row_stride + col_offsets
-        x = tl.load(row_ptr, mask=mask, other=0.0).to(tl.float32)
-
         q_pos = row_idx % n_cols
         causal_mask = mask & (col_offsets <= q_pos)
+        row_ptr = input_ptr + row_idx * input_row_stride + col_offsets
+        x = tl.load(row_ptr, mask=causal_mask, other=0.0).to(tl.float32)
 
         arg = x + x - 1.0
         y = _apply_winner_squareplus_p2(arg)
@@ -622,6 +628,218 @@ def _winner_squareplus_p2_causal_small_fwd(
 
         out_ptr = output_ptr + row_idx * output_row_stride + col_offsets
         tl.store(out_ptr, out, mask=mask)
+
+
+@triton.jit
+def _winner_squareplus_p2_causal_tiered_fwd(
+    input_ptr,
+    output_ptr,
+    n_tier_rows,
+    n_cols,
+    input_row_stride,
+    output_row_stride,
+    row_start,
+    n_matrices,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_step = tl.num_programs(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+
+    total_work = n_tier_rows * n_matrices
+    for work_idx in tl.range(pid, total_work, row_step, num_stages=NUM_STAGES):
+        mat_idx = work_idx // n_tier_rows
+        local_row = work_idx % n_tier_rows
+        actual_row = mat_idx * n_cols + row_start + local_row
+        q_pos = row_start + local_row
+
+        causal_mask = col_offsets <= q_pos
+        row_ptr = input_ptr + actual_row * input_row_stride + col_offsets
+        x = tl.load(row_ptr, mask=causal_mask, other=0.0).to(tl.float32)
+
+        arg = x + x - 1.0
+        y = _apply_winner_squareplus_p2(arg)
+        y = tl.where(causal_mask, y, 0.0)
+
+        row_sum = tl.sum(y, axis=0) + 1e-12
+        out = tl.fdiv(y, row_sum)
+
+        out_ptr = output_ptr + actual_row * output_row_stride + col_offsets
+        tl.store(out_ptr, out, mask=causal_mask)
+
+
+@triton.jit
+def _softplus_norm_causal_bwd(
+    input_ptr,
+    grad_out_ptr,
+    grad_in_ptr,
+    n_rows,
+    n_cols,
+    input_row_stride,
+    grad_out_row_stride,
+    grad_in_row_stride,
+    BLOCK_SIZE: tl.constexpr,
+    ALPHA: tl.constexpr,
+    THETA: tl.constexpr,
+    POWER: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_step = tl.num_programs(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+
+    for row_idx in tl.range(pid, n_rows, row_step, num_stages=NUM_STAGES):
+        q_pos = row_idx % n_cols
+        causal_mask = mask & (col_offsets <= q_pos)
+
+        # Load x and grad_output
+        x_ptr = input_ptr + row_idx * input_row_stride + col_offsets
+        x = tl.load(x_ptr, mask=causal_mask, other=0.0).to(tl.float32)
+        g_ptr = grad_out_ptr + row_idx * grad_out_row_stride + col_offsets
+        g = tl.load(g_ptr, mask=causal_mask, other=0.0).to(tl.float32)
+
+        # Forward recomputation: y_i = sp(alpha*(x-theta))^p
+        arg = ALPHA * (x - THETA)
+        s = arg * arg + 4.0
+        sqrt_s = _fast_sqrt(s)
+        sp = 0.5 * (arg + sqrt_s)
+        if POWER == 1:
+            y = sp
+        elif POWER == 2:
+            y = sp * sp
+        else:
+            y = sp * sp * sp
+        y = tl.where(causal_mask, y, 0.0)
+
+        row_sum = tl.sum(y, axis=0) + 1e-12
+        p = tl.fdiv(y, row_sum)
+
+        # sp'(arg) = 0.5 * (1 + arg / sqrt(arg^2 + 4))
+        sp_prime = 0.5 * (1.0 + arg * tl.rsqrt(s))
+        # dy/dx = ALPHA * POWER * sp^(POWER-1) * sp'
+        if POWER == 1:
+            dydx = ALPHA * sp_prime
+        elif POWER == 2:
+            dydx = ALPHA * 2.0 * sp * sp_prime
+        else:
+            dydx = ALPHA * 3.0 * sp * sp * sp_prime
+        dydx = tl.where(causal_mask, dydx, 0.0)
+
+        # grad_x_i = (dydx_i / S) * (g_i - dot(g, p))
+        dot_gp = tl.sum(g * p, axis=0)
+        grad_x = tl.fdiv(dydx, row_sum) * (g - dot_gp)
+        grad_x = tl.where(causal_mask, grad_x, 0.0)
+
+        out_ptr = grad_in_ptr + row_idx * grad_in_row_stride + col_offsets
+        tl.store(out_ptr, grad_x, mask=mask)
+
+
+@triton.jit
+def _winner_squareplus_p2_causal_bwd(
+    input_ptr,
+    grad_out_ptr,
+    grad_in_ptr,
+    n_rows,
+    n_cols,
+    input_row_stride,
+    grad_out_row_stride,
+    grad_in_row_stride,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_step = tl.num_programs(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+
+    for row_idx in tl.range(pid, n_rows, row_step, num_stages=NUM_STAGES):
+        q_pos = row_idx % n_cols
+        causal_mask = mask & (col_offsets <= q_pos)
+
+        x_ptr = input_ptr + row_idx * input_row_stride + col_offsets
+        x = tl.load(x_ptr, mask=causal_mask, other=0.0).to(tl.float32)
+        g_ptr = grad_out_ptr + row_idx * grad_out_row_stride + col_offsets
+        g = tl.load(g_ptr, mask=causal_mask, other=0.0).to(tl.float32)
+
+        # a = 2x - 1, y = sp(a)^2
+        arg = x + x - 1.0
+        s = arg * arg + 4.0
+        sqrt_s = _fast_sqrt(s)
+        sp = 0.5 * (arg + sqrt_s)
+        y = sp * sp
+        y = tl.where(causal_mask, y, 0.0)
+
+        row_sum = tl.sum(y, axis=0) + 1e-12
+        p = tl.fdiv(y, row_sum)
+
+        # sp'(a) = 0.5*(1 + a*rsqrt(a^2+4)), dy/dx = 4*sp*sp'
+        sp_prime = 0.5 * (1.0 + arg * tl.rsqrt(s))
+        dydx = 4.0 * sp * sp_prime
+        dydx = tl.where(causal_mask, dydx, 0.0)
+
+        dot_gp = tl.sum(g * p, axis=0)
+        grad_x = tl.fdiv(dydx, row_sum) * (g - dot_gp)
+        grad_x = tl.where(causal_mask, grad_x, 0.0)
+
+        out_ptr = grad_in_ptr + row_idx * grad_in_row_stride + col_offsets
+        tl.store(out_ptr, grad_x, mask=mask)
+
+
+@triton.jit
+def _winner_squareplus_p2_causal_tiered_bwd(
+    input_ptr,
+    grad_out_ptr,
+    grad_in_ptr,
+    n_tier_rows,
+    n_cols,
+    input_row_stride,
+    grad_out_row_stride,
+    grad_in_row_stride,
+    row_start,
+    n_matrices,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_step = tl.num_programs(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+
+    total_work = n_tier_rows * n_matrices
+    for work_idx in tl.range(pid, total_work, row_step, num_stages=NUM_STAGES):
+        mat_idx = work_idx // n_tier_rows
+        local_row = work_idx % n_tier_rows
+        actual_row = mat_idx * n_cols + row_start + local_row
+        q_pos = row_start + local_row
+
+        causal_mask = col_offsets <= q_pos
+
+        x_ptr = input_ptr + actual_row * input_row_stride + col_offsets
+        x = tl.load(x_ptr, mask=causal_mask, other=0.0).to(tl.float32)
+        g_ptr = grad_out_ptr + actual_row * grad_out_row_stride + col_offsets
+        g = tl.load(g_ptr, mask=causal_mask, other=0.0).to(tl.float32)
+
+        arg = x + x - 1.0
+        s = arg * arg + 4.0
+        sqrt_s = _fast_sqrt(s)
+        sp = 0.5 * (arg + sqrt_s)
+        y = sp * sp
+        y = tl.where(causal_mask, y, 0.0)
+
+        row_sum = tl.sum(y, axis=0) + 1e-12
+        p = tl.fdiv(y, row_sum)
+
+        sp_prime = 0.5 * (1.0 + arg * tl.rsqrt(s))
+        dydx = 4.0 * sp * sp_prime
+        dydx = tl.where(causal_mask, dydx, 0.0)
+
+        dot_gp = tl.sum(g * p, axis=0)
+        grad_x = tl.fdiv(dydx, row_sum) * (g - dot_gp)
+        grad_x = tl.where(causal_mask, grad_x, 0.0)
+
+        out_ptr = grad_in_ptr + actual_row * grad_in_row_stride + col_offsets
+        tl.store(out_ptr, grad_x, mask=causal_mask)
 
 
 @triton.jit
@@ -814,6 +1032,88 @@ def _is_winner_family(family):
     return family.cache_key == DEFAULT_FAMILY.cache_key
 
 
+_MIN_TIER_BLOCK = 128
+# Tiered dispatch only pays off when T is large enough that SIMD savings
+# exceed the zero_() + multi-launch overhead. On RTX 4090, ~2048+ rows.
+_TIER_THRESHOLD = 2048
+
+
+def _compute_tiers(seq_len):
+    """Split [0, seq_len) into tiers where each tier's BLOCK_SIZE = next_pow2(tier_end).
+
+    Returns list of (row_start, n_tier_rows, block_size).
+    Only tiers when seq_len > threshold and there are at least 2 tiers.
+    """
+    full_block = triton.next_power_of_2(seq_len)
+    if full_block <= _MIN_TIER_BLOCK or seq_len < _TIER_THRESHOLD:
+        return None
+    tiers = []
+    pos = 0
+    block = _MIN_TIER_BLOCK
+    while pos < seq_len and block < full_block:
+        tier_end = min(block, seq_len)
+        if tier_end > pos:
+            tiers.append((pos, tier_end - pos, block))
+        pos = tier_end
+        block *= 2
+    if pos < seq_len:
+        tiers.append((pos, seq_len - pos, full_block))
+    return tiers if len(tiers) > 1 else None
+
+
+def _launch_tiered_fwd(x_2d, out_2d, seq_len, n_matrices):
+    device_props = _device_props()
+    tiers = _compute_tiers(seq_len)
+    if tiers is None:
+        return False
+    out_2d.zero_()
+    for row_start, n_tier_rows, block_size in tiers:
+        num_warps, num_stages = _default_config(block_size)
+        total_work = n_tier_rows * n_matrices
+        num_programs = max(1, min(device_props["num_sm"] * 2, total_work))
+        _winner_squareplus_p2_causal_tiered_fwd[(num_programs,)](
+            x_2d,
+            out_2d,
+            n_tier_rows,
+            seq_len,
+            x_2d.stride(0),
+            out_2d.stride(0),
+            row_start,
+            n_matrices,
+            BLOCK_SIZE=block_size,
+            NUM_STAGES=num_stages,
+            num_warps=num_warps,
+        )
+    return True
+
+
+def _launch_tiered_bwd(x_2d, g_2d, grad_in, seq_len, n_matrices):
+    device_props = _device_props()
+    tiers = _compute_tiers(seq_len)
+    if tiers is None:
+        return False
+    for row_start, n_tier_rows, block_size in tiers:
+        num_warps, num_stages = _default_config(block_size)
+        total_work = n_tier_rows * n_matrices
+        num_programs = max(1, min(device_props["num_sm"] * 2, total_work))
+        _winner_squareplus_p2_causal_tiered_bwd[(num_programs,)](
+            x_2d,
+            g_2d,
+            grad_in,
+            n_tier_rows,
+            seq_len,
+            x_2d.stride(0),
+            g_2d.stride(0),
+            grad_in.stride(0),
+            row_start,
+            n_matrices,
+            BLOCK_SIZE=block_size,
+            NUM_STAGES=num_stages,
+            num_warps=num_warps,
+        )
+    return True
+
+
 def _generic_family_causal_triton_out(out, x, family, *, return_meta=False):
     x_attn = _prepare_attention_input(x)
     kernel_out, user_out = _prepare_output(out, x_attn)
@@ -835,20 +1135,92 @@ def _generic_family_causal_triton_out(out, x, family, *, return_meta=False):
 def _winner_squareplus_causal_triton_out(out, x, *, return_meta=False):
     x_attn = _prepare_attention_input(x)
     kernel_out, user_out = _prepare_output(out, x_attn)
+    seq_len = x_attn.shape[-1]
+    x_2d = x_attn.view(-1, seq_len)
+    out_2d = kernel_out.view(-1, seq_len)
+    n_matrices = x_2d.shape[0] // seq_len
+
+    tiered = _launch_tiered_fwd(x_2d, out_2d, seq_len, n_matrices)
+    if tiered:
+        result = out_2d.view_as(kernel_out)
+        result = _finalize_output(result, user_out)
+        meta = {"variant": "squareplus_winner_tiered", "tiers": _compute_tiers(seq_len)}
+        if return_meta:
+            return result, meta
+        return result
+
     result, meta = _launch_attention_kernel_out(
-        "squareplus_winner_small",
-        _winner_squareplus_p2_causal_small_fwd,
+        "squareplus_winner",
+        _winner_squareplus_p2_causal_fwd,
         x_attn,
         kernel_out,
         return_meta=True,
-        extra_cache_key=("winner_squareplus", "small"),
-        tune_configs=_winner_candidate_configs(x_attn.shape[-1]),
+        extra_cache_key=("winner_squareplus",),
+        tune_configs=_winner_candidate_configs(seq_len),
     )
     result = _finalize_output(result, user_out)
-    meta = {**meta, "variant": "squareplus_winner_small"}
+    meta = {**meta, "variant": "squareplus_winner"}
     if return_meta:
         return result, meta
     return result
+
+
+def _launch_bwd_row_kernel(name, kernel, x, grad_out, n_rows, n_cols, block_size, kernel_kwargs=None):
+    grad_in = torch.empty_like(x)
+    device_props = _device_props()
+    num_warps, num_stages = _default_config(block_size)
+    num_programs = max(1, min(device_props["num_sm"] * 2, n_rows))
+    kernel[(num_programs,)](
+        x,
+        grad_out,
+        grad_in,
+        n_rows,
+        n_cols,
+        x.stride(0),
+        grad_out.stride(0),
+        grad_in.stride(0),
+        BLOCK_SIZE=block_size,
+        NUM_STAGES=num_stages,
+        num_warps=num_warps,
+        **(kernel_kwargs or {}),
+    )
+    return grad_in
+
+
+def _softplus_norm_causal_backward(x, grad_output, family):
+    seq_len = x.shape[-1]
+    x_2d = x.reshape(-1, seq_len)
+    g_2d = grad_output.reshape(-1, seq_len)
+    n_rows, n_cols = x_2d.shape
+    block_size = _pick_block_size(n_cols)
+
+    if _is_winner_family(family):
+        n_matrices = n_rows // n_cols
+        grad_in = torch.empty_like(x_2d)
+        tiered = _launch_tiered_bwd(x_2d, g_2d, grad_in, n_cols, n_matrices)
+        if tiered:
+            return grad_in.view_as(x)
+        grad_in_2d = _launch_bwd_row_kernel(
+            "winner_bwd",
+            _winner_squareplus_p2_causal_bwd,
+            x_2d,
+            g_2d,
+            n_rows,
+            n_cols,
+            block_size,
+        )
+    else:
+        grad_in_2d = _launch_bwd_row_kernel(
+            "generic_bwd",
+            _softplus_norm_causal_bwd,
+            x_2d,
+            g_2d,
+            n_rows,
+            n_cols,
+            block_size,
+            kernel_kwargs=family.kernel_kwargs,
+        )
+    return grad_in_2d.view_as(x)
 
 
 def softmax_triton(x, return_meta=False):
@@ -904,7 +1276,7 @@ def softplus_norm_causal_triton_out(
 ):
     family = _resolve_family(alpha, theta, power, family)
     x_attn = _prepare_attention_input(x)
-    if _is_winner_family(family) and x_attn.shape[-1] <= 256:
+    if _is_winner_family(family):
         return _winner_squareplus_causal_triton_out(
             out,
             x_attn,
@@ -1014,16 +1386,7 @@ class _SoftplusNormCausalAutogradFn(torch.autograd.Function):
 
         (saved_x,) = ctx.saved_tensors
         grad_output = grad_output.contiguous()
-
-        with torch.enable_grad():
-            x = saved_x.detach().requires_grad_(True)
-            ref = softplus_norm_causal_eager(x.float(), family=ctx.family)
-            grad_x = torch.autograd.grad(
-                ref,
-                x,
-                grad_outputs=grad_output.float(),
-                only_inputs=True,
-            )[0]
+        grad_x = _softplus_norm_causal_backward(saved_x, grad_output.float(), ctx.family)
 
         return grad_x, None, None, None
 
@@ -1070,6 +1433,149 @@ class SoftplusNormCausal(torch.nn.Module):
             family=self.family,
             implementation=self.implementation,
         )
+
+
+# ---------------------------------------------------------------------------
+# Flash-style fused QK^T -> sp2norm -> V kernel
+# ---------------------------------------------------------------------------
+# Key insight: sp2norm has no exp() so no overflow risk and no running-max
+# tracking. We can simply accumulate unnormalized output and divide at the end.
+
+
+@triton.jit
+def _sp2norm_flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr,
+    seq_len, scale,
+    stride_qz, stride_qh, stride_qs, stride_qd,
+    stride_kz, stride_kh, stride_ks, stride_kd,
+    stride_vz, stride_vh, stride_vs, stride_vd,
+    stride_oz, stride_oh, stride_os, stride_od,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    D_HEAD: tl.constexpr,
+):
+    q_block_idx = tl.program_id(0)
+    bh_idx = tl.program_id(1)
+
+    q_start = q_block_idx * BLOCK_Q
+    q_offs = q_start + tl.arange(0, BLOCK_Q)
+    d_offs = tl.arange(0, D_HEAD)
+    kv_offs_base = tl.arange(0, BLOCK_KV)
+
+    # Base pointers for this batch-head
+    q_base = Q_ptr + bh_idx * stride_qh
+    k_base = K_ptr + bh_idx * stride_kh
+    v_base = V_ptr + bh_idx * stride_vh
+
+    # Load Q block [BLOCK_Q, D_HEAD]
+    q_ptrs = q_base + q_offs[:, None] * stride_qs + d_offs[None, :] * stride_qd
+    q_mask = q_offs[:, None] < seq_len
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+
+    # Accumulators in fp32
+    o_acc = tl.zeros([BLOCK_Q, D_HEAD], dtype=tl.float32)
+    s_acc = tl.full([BLOCK_Q], 1e-12, dtype=tl.float32)
+
+    # Only iterate up to the last KV block this Q block can attend to (causal)
+    max_kv_block = tl.cdiv(q_start + BLOCK_Q, BLOCK_KV)
+    num_kv_blocks = tl.cdiv(seq_len, BLOCK_KV)
+    end_kv = tl.minimum(max_kv_block, num_kv_blocks)
+
+    for kv_block_idx in tl.range(0, end_kv):
+        kv_start = kv_block_idx * BLOCK_KV
+        kv_offs = kv_start + kv_offs_base
+
+        # Load K [BLOCK_KV, D_HEAD]
+        k_ptrs = k_base + kv_offs[:, None] * stride_ks + d_offs[None, :] * stride_kd
+        k_mask = kv_offs[:, None] < seq_len
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
+
+        # Scores [BLOCK_Q, BLOCK_KV] = Q @ K^T, scaled
+        scores = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
+
+        # Causal mask: key pos <= query pos
+        causal_mask = kv_offs[None, :] <= q_offs[:, None]
+        valid_mask = causal_mask & (kv_offs[None, :] < seq_len) & (q_offs[:, None] < seq_len)
+
+        # sp2norm activation: squareplus(2*s - 1)^2
+        arg = scores + scores - 1.0
+        s = arg * arg + 4.0
+        tmp = arg + _fast_sqrt(s)
+        y = 0.25 * tmp * tmp
+        y = tl.where(valid_mask, y, 0.0)
+
+        # Accumulate row sums
+        s_acc += tl.sum(y, axis=1)
+
+        # Load V [BLOCK_KV, D_HEAD] and accumulate output
+        v_ptrs = v_base + kv_offs[:, None] * stride_vs + d_offs[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=k_mask, other=0.0)
+        o_acc += tl.dot(y.to(v.dtype), v).to(tl.float32)
+
+    # Normalize
+    o = o_acc / s_acc[:, None]
+
+    # Store output
+    o_base = O_ptr + bh_idx * stride_oh
+    o_ptrs = o_base + q_offs[:, None] * stride_os + d_offs[None, :] * stride_od
+    o_mask = q_offs[:, None] < seq_len
+    tl.store(o_ptrs, o.to(q.dtype), mask=o_mask)
+
+
+def sp2norm_flash_attention(q, k, v, *, scale=None):
+    """Fused QK^T -> sp2norm -> V without materializing the T x T score matrix.
+
+    Args:
+        q: [B, H, T, D] query tensor
+        k: [B, H, T, D] key tensor
+        v: [B, H, T, D] value tensor
+        scale: score scaling factor (default: 1/sqrt(D))
+
+    Returns:
+        output: [B, H, T, D] attention output
+    """
+    assert q.ndim == 4 and k.ndim == 4 and v.ndim == 4
+    B, H, T, D = q.shape
+    assert k.shape == (B, H, T, D) and v.shape == (B, H, T, D)
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(D)
+
+    # Ensure contiguous
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    o = torch.empty_like(q)
+
+    # Pick block sizes
+    BLOCK_Q = min(64, triton.next_power_of_2(T))
+    BLOCK_KV = min(64, triton.next_power_of_2(T))
+    D_HEAD = triton.next_power_of_2(D)
+
+    grid = (triton.cdiv(T, BLOCK_Q), B * H)
+
+    _sp2norm_flash_fwd_kernel[grid](
+        q, k, v, o,
+        T, scale,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_KV=BLOCK_KV,
+        D_HEAD=D_HEAD,
+    )
+    return o
+
+
+def sp2norm_flash_attention_eager(q, k, v, *, scale=None):
+    """Eager reference for sp2norm flash attention."""
+    B, H, T, D = q.shape
+    if scale is None:
+        scale = 1.0 / math.sqrt(D)
+    scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
+    attn = softplus_norm_causal_eager(scores)
+    return torch.matmul(attn, v.float()).to(q.dtype)
 
 
 def bench(fn, x=None, warmup=300, iters=1000):

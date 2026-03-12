@@ -24,6 +24,8 @@ from .kernels import (
     softplus_norm_eager,
     softplus_norm_triton,
     softplus_norm_triton_out,
+    sp2norm_flash_attention,
+    sp2norm_flash_attention_eager,
     sp2norm_triton,
 )
 
@@ -53,5 +55,7 @@ __all__ = [
     "softplus_norm_eager",
     "softplus_norm_triton",
     "softplus_norm_triton_out",
+    "sp2norm_flash_attention",
+    "sp2norm_flash_attention_eager",
     "sp2norm_triton",
 ]
