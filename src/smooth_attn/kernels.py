@@ -1526,6 +1526,19 @@ def _sp2norm_flash_fwd_kernel(
     tl.store(o_ptrs, o.to(q.dtype), mask=o_mask)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 64}, num_warps=4, num_stages=2),
+    ],
+    key=["seq_len", "D_HEAD"],
+)
 @triton.jit
 def _sp2norm_flash_fwd_with_rowsum_kernel(
     Q_ptr, K_ptr, V_ptr, O_ptr, RowSum_ptr,
@@ -1609,9 +1622,56 @@ def _sp2norm_flash_fwd_with_rowsum_kernel(
 
 
 @triton.jit
+def _sp2norm_flash_bwd_precompute_delta(
+    O_ptr, DO_ptr, Delta_ptr,
+    seq_len,
+    stride_oz, stride_oh, stride_os, stride_od,
+    stride_doz, stride_doh, stride_dos, stride_dod,
+    stride_dz, stride_dh, stride_ds,
+    BLOCK_Q: tl.constexpr,
+    D_HEAD: tl.constexpr,
+):
+    """Precompute delta = rowwise sum(do * o). Grid: (q_blocks, B * H_q)."""
+    q_block_idx = tl.program_id(0)
+    bh_idx = tl.program_id(1)
+
+    q_start = q_block_idx * BLOCK_Q
+    q_offs = q_start + tl.arange(0, BLOCK_Q)
+    d_offs = tl.arange(0, D_HEAD)
+    q_mask = q_offs[:, None] < seq_len
+
+    o_base = O_ptr + bh_idx * stride_oh
+    do_base = DO_ptr + bh_idx * stride_doh
+
+    o = tl.load(o_base + q_offs[:, None] * stride_os + d_offs[None, :] * stride_od,
+                mask=q_mask, other=0.0).to(tl.float32)
+    do = tl.load(do_base + q_offs[:, None] * stride_dos + d_offs[None, :] * stride_dod,
+                 mask=q_mask, other=0.0).to(tl.float32)
+
+    delta = tl.sum(do * o, axis=1)
+
+    d_base = Delta_ptr + bh_idx * stride_dh
+    tl.store(d_base + q_offs * stride_ds, delta, mask=q_offs < seq_len)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 128}, num_warps=8, num_stages=1),
+    ],
+    key=["seq_len", "D_HEAD"],
+)
+@triton.jit
 def _sp2norm_flash_bwd_dq_kernel(
-    Q_ptr, K_ptr, V_ptr, O_ptr, DO_ptr, DQ_ptr, RowSum_ptr,
+    Q_ptr, K_ptr, V_ptr, O_ptr, DO_ptr, DQ_ptr, RowSum_ptr, Delta_ptr,
     seq_len, scale,
+    n_kv_groups, window_size,
     stride_qz, stride_qh, stride_qs, stride_qd,
     stride_kz, stride_kh, stride_ks, stride_kd,
     stride_vz, stride_vh, stride_vs, stride_vd,
@@ -1619,13 +1679,16 @@ def _sp2norm_flash_bwd_dq_kernel(
     stride_doz, stride_doh, stride_dos, stride_dod,
     stride_dqz, stride_dqh, stride_dqs, stride_dqd,
     stride_rsz, stride_rsh, stride_rss,
+    stride_dtz, stride_dth, stride_dts,
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
     D_HEAD: tl.constexpr,
 ):
-    """Backward pass: compute dQ. Each program handles one Q-block."""
+    """Backward pass: compute dQ + precompute delta. Grid: (q_blocks, B * H_q).
+    Also writes delta for dKV kernel to consume."""
     q_block_idx = tl.program_id(0)
     bh_idx = tl.program_id(1)
+    kv_bh_idx = bh_idx // n_kv_groups
 
     q_start = q_block_idx * BLOCK_Q
     q_offs = q_start + tl.arange(0, BLOCK_Q)
@@ -1633,27 +1696,29 @@ def _sp2norm_flash_bwd_dq_kernel(
     kv_offs_base = tl.arange(0, BLOCK_KV)
 
     q_base = Q_ptr + bh_idx * stride_qh
-    k_base = K_ptr + bh_idx * stride_kh
-    v_base = V_ptr + bh_idx * stride_vh
-    o_base = O_ptr + bh_idx * stride_oh
+    k_base = K_ptr + kv_bh_idx * stride_kh
+    v_base = V_ptr + kv_bh_idx * stride_vh
     do_base = DO_ptr + bh_idx * stride_doh
 
     q_mask = q_offs[:, None] < seq_len
 
-    # Load Q, O, dO blocks [BLOCK_Q, D_HEAD]
     q = tl.load(q_base + q_offs[:, None] * stride_qs + d_offs[None, :] * stride_qd,
                 mask=q_mask, other=0.0)
-    o = tl.load(o_base + q_offs[:, None] * stride_os + d_offs[None, :] * stride_od,
-                mask=q_mask, other=0.0).to(tl.float32)
     do = tl.load(do_base + q_offs[:, None] * stride_dos + d_offs[None, :] * stride_dod,
                  mask=q_mask, other=0.0).to(tl.float32)
 
-    # Load row sums S_i for normalization
+    # Compute delta inline (fused, no separate kernel)
+    o_base = O_ptr + bh_idx * stride_oh
+    o = tl.load(o_base + q_offs[:, None] * stride_os + d_offs[None, :] * stride_od,
+                mask=q_mask, other=0.0).to(tl.float32)
+    delta = tl.sum(do * o, axis=1)
+
+    # Write delta out for the dKV kernel
+    dt_base = Delta_ptr + bh_idx * stride_dth
+    tl.store(dt_base + q_offs * stride_dts, delta, mask=q_offs < seq_len)
+
     rs_base = RowSum_ptr + bh_idx * stride_rsh
     row_sum = tl.load(rs_base + q_offs * stride_rss, mask=q_offs < seq_len, other=1.0)
-
-    # Precompute delta_i = sum_d (do_i * o_i) — used in the Jacobian
-    delta = tl.sum(do * o, axis=1)  # [BLOCK_Q]
 
     dq_acc = tl.zeros([BLOCK_Q, D_HEAD], dtype=tl.float32)
 
@@ -1661,7 +1726,13 @@ def _sp2norm_flash_bwd_dq_kernel(
     num_kv_blocks = tl.cdiv(seq_len, BLOCK_KV)
     end_kv = tl.minimum(max_kv_block, num_kv_blocks)
 
-    for kv_block_idx in tl.range(0, end_kv):
+    if window_size > 0:
+        window_start_pos = tl.maximum(0, q_start - window_size + 1)
+        start_kv = window_start_pos // BLOCK_KV
+    else:
+        start_kv = 0
+
+    for kv_block_idx in tl.range(start_kv, end_kv):
         kv_start = kv_block_idx * BLOCK_KV
         kv_offs = kv_start + kv_offs_base
         kv_mask = kv_offs[:, None] < seq_len
@@ -1669,107 +1740,13 @@ def _sp2norm_flash_bwd_dq_kernel(
         k = tl.load(k_base + kv_offs[:, None] * stride_ks + d_offs[None, :] * stride_kd,
                      mask=kv_mask, other=0.0)
         v = tl.load(v_base + kv_offs[:, None] * stride_vs + d_offs[None, :] * stride_vd,
-                     mask=kv_mask, other=0.0).to(tl.float32)
+                     mask=kv_mask, other=0.0)
 
-        # Recompute scores and activation
         scores = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
         causal_mask = kv_offs[None, :] <= q_offs[:, None]
-        valid_mask = causal_mask & (kv_offs[None, :] < seq_len) & (q_offs[:, None] < seq_len)
-
-        arg = scores + scores - 1.0
-        s = arg * arg + 4.0
-        sqrt_s = _fast_sqrt(s)
-        sp = 0.5 * (arg + sqrt_s)
-        y = sp * sp  # squareplus^2
-        y = tl.where(valid_mask, y, 0.0)
-        p = y / row_sum[:, None]  # p_ij = y_ij / S_i
-
-        # dL/dp_ij = do_i · v_j  →  dp [BLOCK_Q, BLOCK_KV]
-        dp = tl.dot(do.to(q.dtype), tl.trans(v).to(q.dtype)).to(tl.float32)
-
-        # dL/dy_ij = (dp_ij - delta_i) * p_ij / y_ij * y_ij / S_i
-        # Actually: dL/dy_ij = (dp_ij - delta_i) / S_i  (standard softmax-like jacobian)
-        dy = (dp - delta[:, None]) / row_sum[:, None]
-        dy = tl.where(valid_mask, dy, 0.0)
-
-        # dy/ds = 4 * sp * sp' * scale, sp' = 0.5*(1 + arg*rsqrt(s))
-        sp_prime = 0.5 * (1.0 + arg * tl.rsqrt(s))
-        ds = dy * 4.0 * sp * sp_prime * scale
-        ds = tl.where(valid_mask, ds, 0.0)
-
-        # dQ += ds @ K
-        dq_acc += tl.dot(ds.to(k.dtype), k).to(tl.float32)
-
-    # Store dQ
-    dq_base = DQ_ptr + bh_idx * stride_dqh
-    dq_ptrs = dq_base + q_offs[:, None] * stride_dqs + d_offs[None, :] * stride_dqd
-    tl.store(dq_ptrs, dq_acc.to(q.dtype), mask=q_mask)
-
-
-@triton.jit
-def _sp2norm_flash_bwd_dkv_kernel(
-    Q_ptr, K_ptr, V_ptr, O_ptr, DO_ptr, DK_ptr, DV_ptr, RowSum_ptr,
-    seq_len, scale,
-    stride_qz, stride_qh, stride_qs, stride_qd,
-    stride_kz, stride_kh, stride_ks, stride_kd,
-    stride_vz, stride_vh, stride_vs, stride_vd,
-    stride_oz, stride_oh, stride_os, stride_od,
-    stride_doz, stride_doh, stride_dos, stride_dod,
-    stride_dkz, stride_dkh, stride_dks, stride_dkd,
-    stride_dvz, stride_dvh, stride_dvs, stride_dvd,
-    stride_rsz, stride_rsh, stride_rss,
-    BLOCK_Q: tl.constexpr,
-    BLOCK_KV: tl.constexpr,
-    D_HEAD: tl.constexpr,
-):
-    """Backward pass: compute dK, dV. Each program handles one KV-block."""
-    kv_block_idx = tl.program_id(0)
-    bh_idx = tl.program_id(1)
-
-    kv_start = kv_block_idx * BLOCK_KV
-    kv_offs = kv_start + tl.arange(0, BLOCK_KV)
-    d_offs = tl.arange(0, D_HEAD)
-    q_offs_base = tl.arange(0, BLOCK_Q)
-
-    q_base = Q_ptr + bh_idx * stride_qh
-    k_base = K_ptr + bh_idx * stride_kh
-    v_base = V_ptr + bh_idx * stride_vh
-    o_base = O_ptr + bh_idx * stride_oh
-    do_base = DO_ptr + bh_idx * stride_doh
-    rs_base = RowSum_ptr + bh_idx * stride_rsh
-
-    kv_mask = kv_offs[:, None] < seq_len
-
-    # Load K, V blocks
-    k = tl.load(k_base + kv_offs[:, None] * stride_ks + d_offs[None, :] * stride_kd,
-                mask=kv_mask, other=0.0)
-    v = tl.load(v_base + kv_offs[:, None] * stride_vs + d_offs[None, :] * stride_vd,
-                mask=kv_mask, other=0.0)
-
-    dk_acc = tl.zeros([BLOCK_KV, D_HEAD], dtype=tl.float32)
-    dv_acc = tl.zeros([BLOCK_KV, D_HEAD], dtype=tl.float32)
-
-    # Iterate over Q blocks that can attend to this KV block (causal: q >= kv)
-    first_q_block = kv_start // BLOCK_Q
-    num_q_blocks = tl.cdiv(seq_len, BLOCK_Q)
-
-    for q_block_idx in tl.range(first_q_block, num_q_blocks):
-        q_start = q_block_idx * BLOCK_Q
-        q_offs = q_start + q_offs_base
-        q_mask = q_offs[:, None] < seq_len
-
-        q = tl.load(q_base + q_offs[:, None] * stride_qs + d_offs[None, :] * stride_qd,
-                     mask=q_mask, other=0.0)
-        o = tl.load(o_base + q_offs[:, None] * stride_os + d_offs[None, :] * stride_od,
-                     mask=q_mask, other=0.0).to(tl.float32)
-        do = tl.load(do_base + q_offs[:, None] * stride_dos + d_offs[None, :] * stride_dod,
-                      mask=q_mask, other=0.0).to(tl.float32)
-        row_sum = tl.load(rs_base + q_offs * stride_rss, mask=q_offs < seq_len, other=1.0)
-        delta = tl.sum(do * o, axis=1)  # [BLOCK_Q]
-
-        # Recompute scores [BLOCK_Q, BLOCK_KV]
-        scores = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
-        causal_mask = kv_offs[None, :] <= q_offs[:, None]
+        if window_size > 0:
+            window_mask = kv_offs[None, :] > (q_offs[:, None] - window_size)
+            causal_mask = causal_mask & window_mask
         valid_mask = causal_mask & (kv_offs[None, :] < seq_len) & (q_offs[:, None] < seq_len)
 
         arg = scores + scores - 1.0
@@ -1778,7 +1755,6 @@ def _sp2norm_flash_bwd_dkv_kernel(
         sp = 0.5 * (arg + sqrt_s)
         y = sp * sp
         y = tl.where(valid_mask, y, 0.0)
-        p = y / row_sum[:, None]
 
         dp = tl.dot(do.to(q.dtype), tl.trans(v).to(q.dtype)).to(tl.float32)
         dy = (dp - delta[:, None]) / row_sum[:, None]
@@ -1788,16 +1764,128 @@ def _sp2norm_flash_bwd_dkv_kernel(
         ds = dy * 4.0 * sp * sp_prime * scale
         ds = tl.where(valid_mask, ds, 0.0)
 
-        # dK += ds^T @ Q, dV += p^T @ dO  (all dot operands must match dtype)
-        ds_cast = ds.to(q.dtype)
-        dk_acc += tl.dot(tl.trans(ds_cast), q).to(tl.float32)
-        p_cast = p.to(q.dtype)
-        do_cast = do.to(q.dtype)
-        dv_acc += tl.dot(tl.trans(p_cast), do_cast).to(tl.float32)
+        dq_acc += tl.dot(ds.to(k.dtype), k).to(tl.float32)
 
-    # Store dK, dV
-    dk_base = DK_ptr + bh_idx * stride_dkh
-    dv_base = DV_ptr + bh_idx * stride_dvh
+    dq_base = DQ_ptr + bh_idx * stride_dqh
+    dq_ptrs = dq_base + q_offs[:, None] * stride_dqs + d_offs[None, :] * stride_dqd
+    tl.store(dq_ptrs, dq_acc.to(q.dtype), mask=q_mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_Q": 64, "BLOCK_KV": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_Q": 128, "BLOCK_KV": 32}, num_warps=8, num_stages=1),
+    ],
+    key=["seq_len", "D_HEAD"],
+)
+@triton.jit
+def _sp2norm_flash_bwd_dkv_kernel(
+    Q_ptr, K_ptr, V_ptr, DO_ptr, DK_ptr, DV_ptr, RowSum_ptr, Delta_ptr,
+    seq_len, scale,
+    n_kv_groups, window_size, n_q_heads,
+    stride_qz, stride_qh, stride_qs, stride_qd,
+    stride_kz, stride_kh, stride_ks, stride_kd,
+    stride_vz, stride_vh, stride_vs, stride_vd,
+    stride_doz, stride_doh, stride_dos, stride_dod,
+    stride_dkz, stride_dkh, stride_dks, stride_dkd,
+    stride_dvz, stride_dvh, stride_dvs, stride_dvd,
+    stride_rsz, stride_rsh, stride_rss,
+    stride_dtz, stride_dth, stride_dts,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    D_HEAD: tl.constexpr,
+):
+    """Backward pass: compute dK, dV. Grid: (kv_blocks, B * H_kv).
+    Accumulates gradients from ALL query heads in the GQA group."""
+    kv_block_idx = tl.program_id(0)
+    kv_bh_idx = tl.program_id(1)
+
+    kv_start = kv_block_idx * BLOCK_KV
+    kv_offs = kv_start + tl.arange(0, BLOCK_KV)
+    d_offs = tl.arange(0, D_HEAD)
+    q_offs_base = tl.arange(0, BLOCK_Q)
+
+    k_base = K_ptr + kv_bh_idx * stride_kh
+    v_base = V_ptr + kv_bh_idx * stride_vh
+
+    kv_mask = kv_offs[:, None] < seq_len
+
+    k = tl.load(k_base + kv_offs[:, None] * stride_ks + d_offs[None, :] * stride_kd,
+                mask=kv_mask, other=0.0)
+    v = tl.load(v_base + kv_offs[:, None] * stride_vs + d_offs[None, :] * stride_vd,
+                mask=kv_mask, other=0.0)
+
+    dk_acc = tl.zeros([BLOCK_KV, D_HEAD], dtype=tl.float32)
+    dv_acc = tl.zeros([BLOCK_KV, D_HEAD], dtype=tl.float32)
+
+    first_q_block = kv_start // BLOCK_Q
+    num_q_blocks = tl.cdiv(seq_len, BLOCK_Q)
+
+    if window_size > 0:
+        last_q_pos = kv_start + BLOCK_KV - 1 + window_size
+        last_q_block = tl.minimum(tl.cdiv(last_q_pos + 1, BLOCK_Q), num_q_blocks)
+    else:
+        last_q_block = num_q_blocks
+
+    q_bh_start = kv_bh_idx * n_kv_groups
+
+    for group_offset in tl.range(0, n_kv_groups):
+        q_bh_idx = q_bh_start + group_offset
+
+        q_base = Q_ptr + q_bh_idx * stride_qh
+        do_base = DO_ptr + q_bh_idx * stride_doh
+        rs_base = RowSum_ptr + q_bh_idx * stride_rsh
+        dt_base = Delta_ptr + q_bh_idx * stride_dth
+
+        for q_block_idx in tl.range(first_q_block, last_q_block):
+            q_start = q_block_idx * BLOCK_Q
+            q_offs = q_start + q_offs_base
+            q_mask = q_offs[:, None] < seq_len
+
+            q = tl.load(q_base + q_offs[:, None] * stride_qs + d_offs[None, :] * stride_qd,
+                         mask=q_mask, other=0.0)
+            do = tl.load(do_base + q_offs[:, None] * stride_dos + d_offs[None, :] * stride_dod,
+                          mask=q_mask, other=0.0).to(tl.float32)
+            row_sum = tl.load(rs_base + q_offs * stride_rss, mask=q_offs < seq_len, other=1.0)
+            delta = tl.load(dt_base + q_offs * stride_dts, mask=q_offs < seq_len, other=0.0)
+
+            scores = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
+            causal_mask = kv_offs[None, :] <= q_offs[:, None]
+            if window_size > 0:
+                window_mask = kv_offs[None, :] > (q_offs[:, None] - window_size)
+                causal_mask = causal_mask & window_mask
+            valid_mask = causal_mask & (kv_offs[None, :] < seq_len) & (q_offs[:, None] < seq_len)
+
+            arg = scores + scores - 1.0
+            s = arg * arg + 4.0
+            sqrt_s = _fast_sqrt(s)
+            sp = 0.5 * (arg + sqrt_s)
+            y = sp * sp
+            y = tl.where(valid_mask, y, 0.0)
+            p = y / row_sum[:, None]
+
+            dp = tl.dot(do.to(q.dtype), tl.trans(v).to(q.dtype)).to(tl.float32)
+            dy = (dp - delta[:, None]) / row_sum[:, None]
+            dy = tl.where(valid_mask, dy, 0.0)
+
+            sp_prime = 0.5 * (1.0 + arg * tl.rsqrt(s))
+            ds = dy * 4.0 * sp * sp_prime * scale
+            ds = tl.where(valid_mask, ds, 0.0)
+
+            ds_cast = ds.to(q.dtype)
+            dk_acc += tl.dot(tl.trans(ds_cast), q).to(tl.float32)
+            p_cast = p.to(q.dtype)
+            do_cast = do.to(q.dtype)
+            dv_acc += tl.dot(tl.trans(p_cast), do_cast).to(tl.float32)
+
+    dk_base = DK_ptr + kv_bh_idx * stride_dkh
+    dv_base = DV_ptr + kv_bh_idx * stride_dvh
     tl.store(dk_base + kv_offs[:, None] * stride_dks + d_offs[None, :] * stride_dkd,
              dk_acc.to(k.dtype), mask=kv_mask)
     tl.store(dv_base + kv_offs[:, None] * stride_dvs + d_offs[None, :] * stride_dvd,
@@ -1813,10 +1901,8 @@ def _sp2norm_flash_fwd(q, k, v, scale, n_kv_groups=1, window_size=0):
     o = torch.empty_like(q)
     row_sums = torch.empty(B, H_q, T, device=q.device, dtype=torch.float32)
 
-    BLOCK_Q = min(64, triton.next_power_of_2(T))
-    BLOCK_KV = min(64, triton.next_power_of_2(T))
     D_HEAD = triton.next_power_of_2(D)
-    grid = (triton.cdiv(T, BLOCK_Q), B * H_q)
+    grid = lambda meta: (triton.cdiv(T, meta["BLOCK_Q"]), B * H_q)
 
     _sp2norm_flash_fwd_with_rowsum_kernel[grid](
         q, k, v, o, row_sums,
@@ -1826,27 +1912,29 @@ def _sp2norm_flash_fwd(q, k, v, scale, n_kv_groups=1, window_size=0):
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         row_sums.stride(0), row_sums.stride(1), row_sums.stride(2),
-        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, D_HEAD=D_HEAD,
+        D_HEAD=D_HEAD,
     )
     return o, row_sums
 
 
-def _sp2norm_flash_bwd(q, k, v, o, do, row_sums, scale):
-    """Run flash backward: compute dQ, dK, dV."""
-    B, H, T, D = q.shape
+def _sp2norm_flash_bwd(q, k, v, o, do, row_sums, scale, n_kv_groups=1, window_size=0):
+    """Run flash backward: compute dQ, dK, dV. Supports GQA and sliding window."""
+    B, H_q, T, D = q.shape
+    H_kv = k.shape[1]
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
 
-    BLOCK_Q = min(64, triton.next_power_of_2(T))
-    BLOCK_KV = min(64, triton.next_power_of_2(T))
     D_HEAD = triton.next_power_of_2(D)
 
-    # dQ kernel: grid over Q-blocks
-    grid_q = (triton.cdiv(T, BLOCK_Q), B * H)
+    # Delta buffer: computed inline by dQ kernel, consumed by dKV kernel
+    delta = torch.empty(B, H_q, T, device=q.device, dtype=torch.float32)
+
+    # dQ kernel (autotuned) — also computes delta inline
+    grid_q = lambda meta: (triton.cdiv(T, meta["BLOCK_Q"]), B * H_q)
     _sp2norm_flash_bwd_dq_kernel[grid_q](
-        q, k, v, o, do, dq, row_sums,
-        T, scale,
+        q, k, v, o, do, dq, row_sums, delta,
+        T, scale, n_kv_groups, window_size,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -1854,23 +1942,24 @@ def _sp2norm_flash_bwd(q, k, v, o, do, row_sums, scale):
         do.stride(0), do.stride(1), do.stride(2), do.stride(3),
         dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
         row_sums.stride(0), row_sums.stride(1), row_sums.stride(2),
-        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, D_HEAD=D_HEAD,
+        delta.stride(0), delta.stride(1), delta.stride(2),
+        D_HEAD=D_HEAD,
     )
 
-    # dK/dV kernel: grid over KV-blocks
-    grid_kv = (triton.cdiv(T, BLOCK_KV), B * H)
+    # dK/dV kernel (autotuned) — reads precomputed delta
+    grid_kv = lambda meta: (triton.cdiv(T, meta["BLOCK_KV"]), B * H_kv)
     _sp2norm_flash_bwd_dkv_kernel[grid_kv](
-        q, k, v, o, do, dk, dv, row_sums,
-        T, scale,
+        q, k, v, do, dk, dv, row_sums, delta,
+        T, scale, n_kv_groups, window_size, H_q,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         do.stride(0), do.stride(1), do.stride(2), do.stride(3),
         dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
         dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
         row_sums.stride(0), row_sums.stride(1), row_sums.stride(2),
-        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, D_HEAD=D_HEAD,
+        delta.stride(0), delta.stride(1), delta.stride(2),
+        D_HEAD=D_HEAD,
     )
     return dq, dk, dv
 
@@ -1889,8 +1978,10 @@ class _SP2NormFlashAttentionFn(torch.autograd.Function):
     def backward(ctx, grad_output):
         q, k, v, o, row_sums = ctx.saved_tensors
         grad_output = grad_output.contiguous()
-        # Backward currently uses full causal (no window/GQA specialization in bwd kernels yet)
-        dq, dk, dv = _sp2norm_flash_bwd(q, k, v, o, grad_output, row_sums, ctx.scale)
+        dq, dk, dv = _sp2norm_flash_bwd(
+            q, k, v, o, grad_output, row_sums,
+            ctx.scale, ctx.n_kv_groups, ctx.window_size,
+        )
         return dq, dk, dv, None, None, None
 
 
@@ -1956,6 +2047,189 @@ def sp2norm_flash_attention_eager(q, k, v, *, scale=None, window_size=0):
 
     attn = y / (y.sum(dim=-1, keepdim=True) + EPS)
     return torch.matmul(attn, v.float()).to(q.dtype)
+
+
+# ---------------------------------------------------------------------------
+# FP8 Flash Attention — only possible with sp2norm (polynomial, bounded).
+# Softmax's exp() would overflow in FP8 E4M3 range [-448, 448].
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _sp2norm_fp8_flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr, RowSum_ptr,
+    q_scale, k_scale, v_scale,
+    seq_len, attn_scale,
+    n_kv_groups, window_size,
+    stride_qz, stride_qh, stride_qs, stride_qd,
+    stride_kz, stride_kh, stride_ks, stride_kd,
+    stride_vz, stride_vh, stride_vs, stride_vd,
+    stride_oz, stride_oh, stride_os, stride_od,
+    stride_rsz, stride_rsh, stride_rss,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    D_HEAD: tl.constexpr,
+):
+    """FP8 flash attention forward. Q/K/V stored as float8_e4m3fn.
+    Score computation: (Q_fp8 @ K_fp8^T) * q_scale * k_scale * attn_scale.
+    Activation (sp2norm) computed in FP32. PV matmul uses bf16 cast of activation."""
+    q_block_idx = tl.program_id(0)
+    bh_idx = tl.program_id(1)
+    kv_bh_idx = bh_idx // n_kv_groups
+
+    q_start = q_block_idx * BLOCK_Q
+    q_offs = q_start + tl.arange(0, BLOCK_Q)
+    d_offs = tl.arange(0, D_HEAD)
+    kv_offs_base = tl.arange(0, BLOCK_KV)
+
+    q_base = Q_ptr + bh_idx * stride_qh
+    k_base = K_ptr + kv_bh_idx * stride_kh
+    v_base = V_ptr + kv_bh_idx * stride_vh
+
+    q_ptrs = q_base + q_offs[:, None] * stride_qs + d_offs[None, :] * stride_qd
+    q_mask = q_offs[:, None] < seq_len
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0)  # FP8
+
+    o_acc = tl.zeros([BLOCK_Q, D_HEAD], dtype=tl.float32)
+    s_acc = tl.full([BLOCK_Q], 1e-12, dtype=tl.float32)
+
+    # Combined scale: dequant Q * dequant K * attention scale
+    score_scale = q_scale * k_scale * attn_scale
+
+    max_kv_block = tl.cdiv(q_start + BLOCK_Q, BLOCK_KV)
+    num_kv_blocks = tl.cdiv(seq_len, BLOCK_KV)
+    end_kv = tl.minimum(max_kv_block, num_kv_blocks)
+
+    if window_size > 0:
+        window_start_pos = tl.maximum(0, q_start - window_size + 1)
+        start_kv = window_start_pos // BLOCK_KV
+    else:
+        start_kv = 0
+
+    for kv_block_idx in tl.range(start_kv, end_kv):
+        kv_start = kv_block_idx * BLOCK_KV
+        kv_offs = kv_start + kv_offs_base
+
+        k_ptrs = k_base + kv_offs[:, None] * stride_ks + d_offs[None, :] * stride_kd
+        k_mask = kv_offs[:, None] < seq_len
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0)  # FP8
+
+        # FP8 dot: Q_fp8 @ K_fp8^T → FP32, then apply combined scale
+        scores = tl.dot(q, tl.trans(k)).to(tl.float32) * score_scale
+
+        causal_mask = kv_offs[None, :] <= q_offs[:, None]
+        if window_size > 0:
+            window_mask = kv_offs[None, :] > (q_offs[:, None] - window_size)
+            causal_mask = causal_mask & window_mask
+        valid_mask = causal_mask & (kv_offs[None, :] < seq_len) & (q_offs[:, None] < seq_len)
+
+        # sp2norm activation — FULLY in FP32 (no overflow risk, polynomial)
+        arg = scores + scores - 1.0
+        s = arg * arg + 4.0
+        tmp = arg + _fast_sqrt(s)
+        y = 0.25 * tmp * tmp
+        y = tl.where(valid_mask, y, 0.0)
+
+        s_acc += tl.sum(y, axis=1)
+
+        # PV matmul: load V as FP8, cast activation to bf16 for dot
+        v_ptrs = v_base + kv_offs[:, None] * stride_vs + d_offs[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=k_mask, other=0.0)  # FP8
+        # Cast both to bf16 for the PV dot (FP8 y values may exceed E4M3 range)
+        o_acc += tl.dot(y.to(tl.bfloat16), v.to(tl.bfloat16)).to(tl.float32) * v_scale
+
+    o = o_acc / s_acc[:, None]
+
+    o_base = O_ptr + bh_idx * stride_oh
+    o_ptrs = o_base + q_offs[:, None] * stride_os + d_offs[None, :] * stride_od
+    o_mask = q_offs[:, None] < seq_len
+    tl.store(o_ptrs, o.to(tl.bfloat16), mask=o_mask)
+
+    rs_base = RowSum_ptr + bh_idx * stride_rsh
+    tl.store(rs_base + q_offs * stride_rss, s_acc, mask=q_offs < seq_len)
+
+
+def _quantize_to_fp8(x):
+    """Quantize BF16/FP32 tensor to FP8 E4M3 with per-tensor absmax scaling.
+
+    Returns (x_fp8, scale) where x ≈ x_fp8 * scale.
+    """
+    FP8_MAX = 448.0  # E4M3 max
+    amax = x.detach().float().abs().amax()
+    scale = (amax / FP8_MAX).clamp(min=1e-12)
+    x_scaled = (x.float() / scale).clamp(-FP8_MAX, FP8_MAX)
+    return x_scaled.to(torch.float8_e4m3fn), scale.item()
+
+
+def _sp2norm_fp8_flash_fwd(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale,
+                            attn_scale, n_kv_groups=1, window_size=0):
+    """Run FP8 flash forward. Inputs are pre-quantized FP8 E4M3 tensors."""
+    B, H_q, T, D = q_fp8.shape
+    o = torch.empty(B, H_q, T, D, device=q_fp8.device, dtype=torch.bfloat16)
+    row_sums = torch.empty(B, H_q, T, device=q_fp8.device, dtype=torch.float32)
+
+    D_HEAD = triton.next_power_of_2(D)
+    BLOCK_Q = min(64, triton.next_power_of_2(T))
+    BLOCK_KV = min(64, triton.next_power_of_2(T))
+    grid = (triton.cdiv(T, BLOCK_Q), B * H_q)
+
+    _sp2norm_fp8_flash_fwd_kernel[grid](
+        q_fp8, k_fp8, v_fp8, o, row_sums,
+        q_scale, k_scale, v_scale,
+        T, attn_scale, n_kv_groups, window_size,
+        q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2), q_fp8.stride(3),
+        k_fp8.stride(0), k_fp8.stride(1), k_fp8.stride(2), k_fp8.stride(3),
+        v_fp8.stride(0), v_fp8.stride(1), v_fp8.stride(2), v_fp8.stride(3),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        row_sums.stride(0), row_sums.stride(1), row_sums.stride(2),
+        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, D_HEAD=D_HEAD,
+    )
+    return o, row_sums
+
+
+def sp2norm_fp8_flash_attention(q, k, v, *, scale=None, window_size=0):
+    """FP8 fused flash attention — only possible with sp2norm.
+
+    Quantizes BF16 Q/K/V to FP8 E4M3 with per-tensor scaling, runs
+    flash attention with FP8 tensor core matmuls for QK^T, and returns
+    BF16 output. The sp2norm activation is computed in full FP32.
+
+    Why this works with sp2norm but NOT softmax:
+    - sp2norm is polynomial: squareplus(2x-1)^2. Bounded for bounded input.
+    - softmax uses exp(x), which for x > 4.5 exceeds E4M3 max (448) → overflow.
+    - sp2norm at x=4.5: squareplus(8)^2 ≈ 65. Well within FP8 range.
+
+    Args:
+        q: [B, H_q, T, D] query tensor (BF16)
+        k: [B, H_kv, T, D] key tensor (BF16)
+        v: [B, H_kv, T, D] value tensor (BF16)
+        scale: score scaling factor (default: 1/sqrt(D))
+        window_size: sliding window size (0 = full causal)
+
+    Returns:
+        output: [B, H_q, T, D] attention output (BF16)
+    """
+    assert q.ndim == 4 and k.ndim == 4 and v.ndim == 4
+    B, H_q, T, D = q.shape
+    H_kv = k.shape[1]
+    assert k.shape == (B, H_kv, T, D) and v.shape == (B, H_kv, T, D)
+    assert H_q % H_kv == 0, f"H_q ({H_q}) must be divisible by H_kv ({H_kv})"
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(D)
+
+    n_kv_groups = H_q // H_kv
+
+    # Quantize to FP8 E4M3 with per-tensor scaling
+    q_fp8, q_scale = _quantize_to_fp8(q)
+    k_fp8, k_scale = _quantize_to_fp8(k)
+    v_fp8, v_scale = _quantize_to_fp8(v)
+
+    o, _row_sums = _sp2norm_fp8_flash_fwd(
+        q_fp8.contiguous(), k_fp8.contiguous(), v_fp8.contiguous(),
+        q_scale, k_scale, v_scale,
+        scale, n_kv_groups, window_size,
+    )
+    return o
 
 
 def bench(fn, x=None, warmup=300, iters=1000):
