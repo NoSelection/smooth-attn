@@ -1,0 +1,140 @@
+================================================================================
+CTX=1024 RERUN | FLAT LR | EXACT MATH | REGULAR ADAMW | TF32 OFF
+================================================================================
+
+################################################################################
+  SEED = 42
+################################################################################
+
+  softmax_bf16 (seed=42, ctx=1024)
+      step   500 | val 2.4887 ppl 12.05 | lr 3.00e-04 | 4s
+      step  1000 | val 2.4762 ppl 11.90 | lr 3.00e-04 | 8s
+      step  1500 | val 2.3430 ppl 10.41 | lr 3.00e-04 | 12s
+      step  2000 | val 2.1538 ppl 8.62 | lr 3.00e-04 | 17s
+      step  2500 | val 1.9833 ppl 7.27 | lr 3.00e-04 | 21s
+      step  3000 | val 1.8879 ppl 6.61 | lr 3.00e-04 | 25s
+      step  3500 | val 1.8157 ppl 6.15 | lr 3.00e-04 | 29s
+      step  4000 | val 1.7499 ppl 5.75 | lr 3.00e-04 | 33s
+      step  4500 | val 1.7194 ppl 5.58 | lr 3.00e-04 | 37s
+      step  5000 | val 1.7041 ppl 5.50 | lr 3.00e-04 | 41s
+      step  5500 | val 1.6684 ppl 5.30 | lr 3.00e-04 | 45s
+      step  6000 | val 1.6254 ppl 5.08 | lr 3.00e-04 | 49s
+      step  6500 | val 1.6133 ppl 5.02 | lr 3.00e-04 | 54s
+      step  7000 | val 1.5988 ppl 4.95 | lr 3.00e-04 | 58s
+      step  7500 | val 1.5993 ppl 4.95 | lr 3.00e-04 | 62s
+      step  8000 | val 1.5697 ppl 4.81 | lr 3.00e-04 | 66s
+    Total: 65.9s
+
+  sp2norm_fused (seed=42, ctx=1024)
+      step   500 | val 2.4863 ppl 12.02 | lr 3.00e-04 | 4s
+      step  1000 | val 2.4787 ppl 11.93 | lr 3.00e-04 | 8s
+      step  1500 | val 2.4329 ppl 11.39 | lr 3.00e-04 | 13s
+      step  2000 | val 2.3598 ppl 10.59 | lr 3.00e-04 | 17s
+      step  2500 | val 2.1339 ppl 8.45 | lr 3.00e-04 | 21s
+      step  3000 | val 1.9969 ppl 7.37 | lr 3.00e-04 | 25s
+      step  3500 | val 1.8845 ppl 6.58 | lr 3.00e-04 | 29s
+      step  4000 | val 1.7971 ppl 6.03 | lr 3.00e-04 | 34s
+      step  4500 | val 1.7587 ppl 5.80 | lr 3.00e-04 | 38s
+      step  5000 | val 1.7410 ppl 5.70 | lr 3.00e-04 | 42s
+      step  5500 | val 1.7007 ppl 5.48 | lr 3.00e-04 | 46s
+      step  6000 | val 1.6577 ppl 5.25 | lr 3.00e-04 | 51s
+      step  6500 | val 1.6477 ppl 5.20 | lr 3.00e-04 | 55s
+      step  7000 | val 1.6289 ppl 5.10 | lr 3.00e-04 | 59s
+      step  7500 | val 1.6272 ppl 5.09 | lr 3.00e-04 | 63s
+      step  8000 | val 1.5922 ppl 4.91 | lr 3.00e-04 | 67s
+    Total: 67.3s
+
+################################################################################
+  SEED = 137
+################################################################################
+
+  softmax_bf16 (seed=137, ctx=1024)
+      step   500 | val 2.4875 ppl 12.03 | lr 3.00e-04 | 4s
+      step  1000 | val 2.4584 ppl 11.69 | lr 3.00e-04 | 8s
+      step  1500 | val 2.3154 ppl 10.13 | lr 3.00e-04 | 12s
+      step  2000 | val 2.0885 ppl 8.07 | lr 3.00e-04 | 16s
+      step  2500 | val 1.9660 ppl 7.14 | lr 3.00e-04 | 20s
+      step  3000 | val 1.8772 ppl 6.53 | lr 3.00e-04 | 24s
+      step  3500 | val 1.8228 ppl 6.19 | lr 3.00e-04 | 28s
+      step  4000 | val 1.7639 ppl 5.84 | lr 3.00e-04 | 32s
+      step  4500 | val 1.7150 ppl 5.56 | lr 3.00e-04 | 37s
+      step  5000 | val 1.6900 ppl 5.42 | lr 3.00e-04 | 41s
+      step  5500 | val 1.6640 ppl 5.28 | lr 3.00e-04 | 45s
+      step  6000 | val 1.6537 ppl 5.23 | lr 3.00e-04 | 49s
+      step  6500 | val 1.6231 ppl 5.07 | lr 3.00e-04 | 53s
+      step  7000 | val 1.6208 ppl 5.06 | lr 3.00e-04 | 57s
+      step  7500 | val 1.6105 ppl 5.01 | lr 3.00e-04 | 61s
+      step  8000 | val 1.5748 ppl 4.83 | lr 3.00e-04 | 65s
+    Total: 65.0s
+
+  sp2norm_fused (seed=137, ctx=1024)
+      step   500 | val 2.4854 ppl 12.01 | lr 3.00e-04 | 4s
+      step  1000 | val 2.4741 ppl 11.87 | lr 3.00e-04 | 9s
+      step  1500 | val 2.4222 ppl 11.27 | lr 3.00e-04 | 13s
+      step  2000 | val 2.2372 ppl 9.37 | lr 3.00e-04 | 17s
+      step  2500 | val 2.0650 ppl 7.89 | lr 3.00e-04 | 21s
+      step  3000 | val 1.9134 ppl 6.78 | lr 3.00e-04 | 25s
+      step  3500 | val 1.8483 ppl 6.35 | lr 3.00e-04 | 30s
+      step  4000 | val 1.7745 ppl 5.90 | lr 3.00e-04 | 34s
+      step  4500 | val 1.7279 ppl 5.63 | lr 3.00e-04 | 38s
+      step  5000 | val 1.6968 ppl 5.46 | lr 3.00e-04 | 42s
+      step  5500 | val 1.6693 ppl 5.31 | lr 3.00e-04 | 47s
+      step  6000 | val 1.6578 ppl 5.25 | lr 3.00e-04 | 51s
+      step  6500 | val 1.6361 ppl 5.14 | lr 3.00e-04 | 55s
+      step  7000 | val 1.6218 ppl 5.06 | lr 3.00e-04 | 59s
+      step  7500 | val 1.6137 ppl 5.02 | lr 3.00e-04 | 63s
+      step  8000 | val 1.5886 ppl 4.90 | lr 3.00e-04 | 68s
+    Total: 67.6s
+
+################################################################################
+  SEED = 2024
+################################################################################
+
+  softmax_bf16 (seed=2024, ctx=1024)
+      step   500 | val 2.4915 ppl 12.08 | lr 3.00e-04 | 4s
+      step  1000 | val 2.4535 ppl 11.63 | lr 3.00e-04 | 8s
+      step  1500 | val 2.3208 ppl 10.18 | lr 3.00e-04 | 12s
+      step  2000 | val 2.1032 ppl 8.19 | lr 3.00e-04 | 16s
+      step  2500 | val 1.9541 ppl 7.06 | lr 3.00e-04 | 20s
+      step  3000 | val 1.8787 ppl 6.55 | lr 3.00e-04 | 24s
+      step  3500 | val 1.8088 ppl 6.10 | lr 3.00e-04 | 28s
+      step  4000 | val 1.7412 ppl 5.70 | lr 3.00e-04 | 32s
+      step  4500 | val 1.6903 ppl 5.42 | lr 3.00e-04 | 37s
+      step  5000 | val 1.6917 ppl 5.43 | lr 3.00e-04 | 41s
+      step  5500 | val 1.6350 ppl 5.13 | lr 3.00e-04 | 45s
+      step  6000 | val 1.6312 ppl 5.11 | lr 3.00e-04 | 49s
+      step  6500 | val 1.5992 ppl 4.95 | lr 3.00e-04 | 53s
+      step  7000 | val 1.6034 ppl 4.97 | lr 3.00e-04 | 57s
+      step  7500 | val 1.5934 ppl 4.92 | lr 3.00e-04 | 61s
+      step  8000 | val 1.5755 ppl 4.83 | lr 3.00e-04 | 65s
+    Total: 65.0s
+
+  sp2norm_fused (seed=2024, ctx=1024)
+      step   500 | val 2.4931 ppl 12.10 | lr 3.00e-04 | 4s
+      step  1000 | val 2.4752 ppl 11.88 | lr 3.00e-04 | 8s
+      step  1500 | val 2.4240 ppl 11.29 | lr 3.00e-04 | 13s
+      step  2000 | val 2.2843 ppl 9.82 | lr 3.00e-04 | 17s
+      step  2500 | val 2.0930 ppl 8.11 | lr 3.00e-04 | 21s
+      step  3000 | val 1.9632 ppl 7.12 | lr 3.00e-04 | 25s
+      step  3500 | val 1.8711 ppl 6.50 | lr 3.00e-04 | 29s
+      step  4000 | val 1.7907 ppl 5.99 | lr 3.00e-04 | 34s
+      step  4500 | val 1.7452 ppl 5.73 | lr 3.00e-04 | 38s
+      step  5000 | val 1.7217 ppl 5.59 | lr 3.00e-04 | 42s
+      step  5500 | val 1.6752 ppl 5.34 | lr 3.00e-04 | 46s
+      step  6000 | val 1.6575 ppl 5.25 | lr 3.00e-04 | 50s
+      step  6500 | val 1.6224 ppl 5.07 | lr 3.00e-04 | 55s
+      step  7000 | val 1.6134 ppl 5.02 | lr 3.00e-04 | 59s
+      step  7500 | val 1.6065 ppl 4.99 | lr 3.00e-04 | 63s
+      step  8000 | val 1.5853 ppl 4.88 | lr 3.00e-04 | 67s
+    Total: 67.3s
+
+================================================================================
+FINAL RESULTS
+================================================================================
+softmax_bf16 vals: [1.5696639696756998, 1.5748474955558778, 1.5754629731178285]
+sp2norm_fused vals: [1.5921972791353862, 1.588576324780782, 1.5853231430053711]
+softmax_bf16 mean: 1.5733
+sp2norm_fused mean: 1.5887
+quality gap (%): +0.98%
+speedup: 0.97x
+wins: 0/3
