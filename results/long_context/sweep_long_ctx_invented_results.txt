@@ -25,3 +25,12 @@ Using eager attention for flexible invented formulas
       step  1500 | val 2.4470 ppl 11.55 | 152s
       step  2000 | val 2.3962 ppl 10.98 | 200s
       step  2500 | val 2.1874 ppl 8.91 | 249s
+      step  3000 | val 2.0341 ppl 7.65 | 300s
+  Final: 2.0341 in 300s
+
+============================================================
+  squareplus(2 * ((x - row_max_visible) + 0.5))^2 / sum
+============================================================
+      step   500 | val 2.4885 ppl 12.04 | 57s
+      step  1000 | val 2.4871 ppl 12.03 | 113s
+      step  1500 | val 2.4419 ppl 11.50 | 171s

@@ -6,7 +6,7 @@ Smooth squareplus attention normalization kernels for PyTorch + Triton.
 - Triton forward kernels for row-wise and causal normalization
 - a production-focused causal benchmark centered on reusable output buffers
 - a differentiable training API with Triton forward and safe eager backward
-- the winning squareplus family `squareplus(alpha * (x - theta))^power / sum`
+- the current default squareplus family `squareplus(alpha * (x - theta))^power / sum`
 
 ## Why this exists
 
@@ -16,7 +16,14 @@ Softmax is not the only useful normalization for attention. This repo explores a
 squareplus(alpha * (x - theta))^power / sum
 ```
 
-In the current prototype, the best regime is causal attention in mixed precision. On the local RTX 4090 runs from this workspace, the `bf16` causal family kernel reached a geometric mean of roughly `0.81x` vs PyTorch masked softmax timing, meaning about `1.24x` faster overall in that benchmark configuration. Results will vary by GPU, Triton version, and shape mix.
+Current evidence is mixed and still research-grade. On local RTX 4090 causal
+microbenchmarks from this workspace, the `bf16` family kernel can be faster
+than a PyTorch masked-softmax baseline for the tested shape mix. In the small
+Shakespeare training experiments under `results/`, eager squareplus is
+competitive at shorter context, but the fused fixed-threshold family does not
+currently beat softmax in the longer-context `ctx=1024` runs. Treat this repo
+as an exploration of alternative normalized attention, not yet as a proven
+softmax replacement.
 
 ## Status
 
@@ -24,6 +31,7 @@ In the current prototype, the best regime is causal attention in mixed precision
 - Causal mixed-precision benchmark: implemented
 - Public training API: implemented
 - Backward: correct eager fallback, not fused Triton yet
+- Training evidence: exploratory and mixed; see `results/`
 
 ## Install
 
@@ -132,7 +140,7 @@ Research scripts and raw result logs are kept out of the package code on purpose
 
 - This project currently targets NVIDIA GPUs with CUDA and Triton.
 - The backward pass is intentionally conservative for now: Triton forward, eager backward.
-- The mainline keeps the winning fixed-theta squareplus family and drops the losing formula branches from the public CLI.
+- The mainline keeps a fixed-theta squareplus default family for reproducible experiments; broader formula search remains experimental.
 - The next major systems win is a fused Triton backward for the causal family path.
 
 ## License
