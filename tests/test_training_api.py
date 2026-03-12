@@ -90,3 +90,32 @@ def test_flash_attention_matches_eager(seq_len):
 
     assert not out_flash.isnan().any(), "NaN in flash output"
     torch.testing.assert_close(out_flash.float(), out_eager.float(), atol=2e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_flash_attention_backward():
+    import math
+    from smooth_attn import softplus_norm_causal_eager
+
+    B, H, T, D = 1, 2, 64, 32
+    scale = 1.0 / math.sqrt(D)
+
+    q = torch.randn(B, H, T, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(B, H, T, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(B, H, T, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    upstream = torch.randn(B, H, T, D, device="cuda", dtype=torch.float32)
+
+    out = sp2norm_flash_attention(q, k, v)
+    (out.float() * upstream).sum().backward()
+    dq_flash, dk_flash, dv_flash = q.grad.clone(), k.grad.clone(), v.grad.clone()
+
+    q_ref = q.detach().clone().float().requires_grad_(True)
+    k_ref = k.detach().clone().float().requires_grad_(True)
+    v_ref = v.detach().clone().float().requires_grad_(True)
+    scores = torch.matmul(q_ref, k_ref.transpose(-2, -1)) * scale
+    attn = softplus_norm_causal_eager(scores)
+    (torch.matmul(attn, v_ref) * upstream).sum().backward()
+
+    torch.testing.assert_close(dq_flash.float(), q_ref.grad.float(), atol=5e-2, rtol=0.1)
+    torch.testing.assert_close(dk_flash.float(), k_ref.grad.float(), atol=5e-2, rtol=0.1)
+    torch.testing.assert_close(dv_flash.float(), v_ref.grad.float(), atol=5e-2, rtol=0.1)
