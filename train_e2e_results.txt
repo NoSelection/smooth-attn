@@ -1,0 +1,64 @@
+================================================================================
+END-TO-END TRAINING: SOFTMAX vs SP2NORM_EAGER vs SP2NORM_FUSED
+================================================================================
+GPU: NVIDIA GeForce RTX 4090
+Config: 6L/6H/192d, ctx=256, batch=32, steps=2000
+
+============================================================
+  TRAINING: softmax
+============================================================
+    params=2,740,289
+      step   500 | val 2.3608 ppl 10.60 | sink 0.0003 pos0 0.0069 sparse 0.818 | 10s
+      step  1000 | val 2.0490 ppl 7.76 | sink 0.0001 pos0 0.0025 sparse 0.857 | 19s
+      step  1500 | val 1.8791 ppl 6.55 | sink 0.0001 pos0 0.0023 sparse 0.868 | 27s
+      step  2000 | val 1.7731 ppl 5.89 | sink 0.0002 pos0 0.0026 sparse 0.875 | 37s
+      Sample:  Sestair eir, come a constined thy fone.  ISABELLA: Dish, his should the take not ear my prasse abend Seeps live Bingecter my lettrand now my charry. 
+    Total time: 36.6s
+
+============================================================
+  TRAINING: sp2norm_eager
+============================================================
+    params=2,740,289
+      step   500 | val 2.3308 ppl 10.29 | sink 0.0006 pos0 0.0044 sparse 0.852 | 14s
+      step  1000 | val 1.9990 ppl 7.38 | sink 0.0001 pos0 0.0021 sparse 0.881 | 28s
+      step  1500 | val 1.8401 ppl 6.30 | sink 0.0001 pos0 0.0024 sparse 0.887 | 41s
+      step  2000 | val 1.7404 ppl 5.70 | sink 0.0001 pos0 0.0034 sparse 0.889 | 54s
+      Sample:  Servo a piled As madany thee cust Manarcius with senace, But show himsely, his foes not proside.  My seeks: The Bride the day! This Shall my charts b
+    Total time: 54.5s
+
+============================================================
+  TRAINING: sp2norm_fused
+============================================================
+    params=2,740,289
+      step   500 | val 2.3574 ppl 10.56 | sink   N/A  pos0   N/A  sparse  N/A  | 5s
+      step  1000 | val 2.0565 ppl 7.82 | sink   N/A  pos0   N/A  sparse  N/A  | 9s
+      step  1500 | val 1.8815 ppl 6.56 | sink   N/A  pos0   N/A  sparse  N/A  | 14s
+      step  2000 | val 1.7642 ppl 5.84 | sink   N/A  pos0   N/A  sparse  N/A  | 19s
+      Sample:  The seet of divereed it our of this here, Thus great more forms to hoursayly? God ext should but to the deents nonguess, The natch croter one beat, w
+    Total time: 18.6s
+
+
+================================================================================
+FINAL REPORT
+================================================================================
+
+  --- Val Loss Curve ---
+    Step             softmax       sp2norm_eager       sp2norm_fused
+  --------------------------------------------------------------------
+     500              2.3608              2.3308              2.3574
+    1000              2.0490              1.9990              2.0565
+    1500              1.8791              1.8401              1.8815
+    2000              1.7731              1.7404              1.7642
+
+  --- Final (step 2000) ---
+             Variant      Val      PPL     Time   vs softmax    Speedup
+  ----------------------------------------------------------------------
+             softmax   1.7731     5.89     37s      BASELINE      1.00x
+       sp2norm_eager   1.7404     5.70     54s        -1.84%      0.67x
+       sp2norm_fused   1.7642     5.84     19s        -0.50%      1.97x
+
+  Fused vs Eager drift: 1.37% (should be <1%)
+
+================================================================================
+DONE
+================================================================================
