@@ -28,6 +28,7 @@ from smooth_attn import DEFAULT_FAMILY, softplus_norm_causal_eager, sp2norm_flas
 DEVICE = 'cuda'
 ATTN_DROPOUT = 0.0
 RESID_DROPOUT = 0.1
+SP2_EXACT_MATH = True
 
 # ============================================================
 # Data
@@ -141,28 +142,25 @@ class MHA_Fused(nn.Module):
 
     def forward(self, x, capture=False):
         B, T, C = x.shape
-        qkv = self.qkv(x).reshape(B, T, 3, self.n_head, self.hs)
-        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            qkv = self.qkv(x).reshape(B, T, 3, self.n_head, self.hs)
+            q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
 
-        q_bf = q.to(torch.bfloat16)
-        k_bf = k.to(torch.bfloat16)
-        v_bf = v.to(torch.bfloat16)
-
-        out = sp2norm_flash_attention(q_bf, k_bf, v_bf)
-        out = out.to(x.dtype)
+            out = sp2norm_flash_attention(q, k, v, exact_math=SP2_EXACT_MATH)
+            out = out.transpose(1, 2).reshape(B, T, C)
+            out = self.proj(out)
 
         if capture:
             # Diagnostic: compute attention weights eagerly for metrics only
             with torch.no_grad():
-                wei = (q @ k.transpose(-2, -1)) * (self.hs ** -0.5)
+                wei = (q.float() @ k.float().transpose(-2, -1)) * (self.hs ** -0.5)
                 mask = self.tril[:T, :T] == 0
                 self.last_attn_weights = attn_sp2norm_eager(wei, mask).detach()
 
-        out = out.transpose(1, 2).reshape(B, T, C)
-        return self.proj_drop(self.proj(out))
+        return self.proj_drop(out)
 
 
 def build_model(variant, n_embd, n_head, n_layer, max_ctx):

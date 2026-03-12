@@ -1,0 +1,223 @@
+================================================================================
+TANK vs TANK: FAIR BF16 COMPARISON
+================================================================================
+GPU: NVIDIA GeForce RTX 4090
+Config: 6L/6H/192d, ctx=256, batch=32, steps=5000
+Seeds: [42, 137, 2024]
+
+
+################################################################################
+  SEED = 42
+################################################################################
+
+  ============================================================
+    softmax_fp32 (seed=42)
+  ============================================================
+      step   500 | val 2.3568 ppl 10.56 | sink 0.0004 pos0 0.0069 sparse 0.820 | 9s
+      step  1000 | val 2.0453 ppl 7.73 | sink 0.0001 pos0 0.0028 sparse 0.859 | 18s
+      step  2000 | val 1.7766 ppl 5.91 | sink 0.0001 pos0 0.0031 sparse 0.877 | 35s
+      step  3000 | val 1.6672 ppl 5.30 | sink 0.0001 pos0 0.0035 sparse 0.882 | 51s
+      step  4000 | val 1.6108 ppl 5.01 | sink 0.0001 pos0 0.0035 sparse 0.887 | 68s
+      step  5000 | val 1.5666 ppl 4.79 | sink 0.0002 pos0 0.0042 sparse 0.888 | 85s
+      Sample:  DUKE VINCENTIO: God and perproud to deserver'd lie! that he country This broak known thy face: in my seest when here Stay, swear all 't' draw and the
+    Total time: 85.1s
+
+
+  ============================================================
+    softmax_bf16 (seed=42)
+  ============================================================
+      step   500 | val 2.3582 ppl 10.57 | sink 0.0003 pos0 0.0069 sparse 0.820 | 4s
+      step  1000 | val 2.0397 ppl 7.69 | sink 0.0001 pos0 0.0027 sparse 0.860 | 8s
+      step  2000 | val 1.7745 ppl 5.90 | sink 0.0001 pos0 0.0031 sparse 0.876 | 16s
+      step  3000 | val 1.6623 ppl 5.27 | sink 0.0001 pos0 0.0036 sparse 0.882 | 23s
+      step  4000 | val 1.6094 ppl 5.00 | sink 0.0001 pos0 0.0037 sparse 0.887 | 31s
+      step  5000 | val 1.5686 ppl 4.80 | sink 0.0002 pos0 0.0041 sparse 0.887 | 39s
+      Sample:  DUKE VINCENTIO: Most both with is bud head, Condurater, whom with I 'Tis not more.  QUEEN MARGARET: Sainst what's a trial?  KING RICHARD III: Be repe
+    Total time: 39.0s
+
+
+  ============================================================
+    sp2norm_eager (seed=42)
+  ============================================================
+      step   500 | val 2.3562 ppl 10.55 | sink 0.0003 pos0 0.0069 sparse 0.817 | 17s
+      step  1000 | val 2.0532 ppl 7.79 | sink 0.0001 pos0 0.0035 sparse 0.847 | 34s
+      step  2000 | val 1.7661 ppl 5.85 | sink 0.0001 pos0 0.0032 sparse 0.875 | 68s
+      step  3000 | val 1.6513 ppl 5.21 | sink 0.0001 pos0 0.0034 sparse 0.881 | 102s
+      step  4000 | val 1.5957 ppl 4.93 | sink 0.0001 pos0 0.0039 sparse 0.883 | 135s
+      step  5000 | val 1.5528 ppl 4.72 | sink 0.0002 pos0 0.0046 sparse 0.884 | 169s
+      Sample:  Drink Juliet's pery and jeward into destray. Do weret a whomest your right, and your best action To have more fall the endiners talk of the generals 
+    Total time: 169.0s
+
+
+  ============================================================
+    sp2norm_fused (seed=42)
+  ============================================================
+      step   500 | val 2.3558 ppl 10.55 | sink 0.0003 pos0 0.0069 sparse 0.817 | 4s
+      step  1000 | val 2.0490 ppl 7.76 | sink 0.0001 pos0 0.0034 sparse 0.849 | 8s
+      step  2000 | val 1.7624 ppl 5.83 | sink 0.0001 pos0 0.0033 sparse 0.873 | 16s
+      step  3000 | val 1.6434 ppl 5.17 | sink 0.0001 pos0 0.0034 sparse 0.879 | 24s
+      step  4000 | val 1.5931 ppl 4.92 | sink 0.0001 pos0 0.0040 sparse 0.882 | 32s
+      step  5000 | val 1.5459 ppl 4.69 | sink 0.0003 pos0 0.0044 sparse 0.883 | 40s
+      Sample:  DUKE VINCENTIO: Why, so not come to destary; but rather while we him dispoke To your balms' of to me?  ELBOW: God must not sway talk with his sake Le
+    Total time: 39.7s
+
+
+################################################################################
+  SEED = 137
+################################################################################
+
+  ============================================================
+    softmax_fp32 (seed=137)
+  ============================================================
+      step   500 | val 2.3508 ppl 10.49 | sink 0.0007 pos0 0.0078 sparse 0.821 | 9s
+      step  1000 | val 2.0370 ppl 7.67 | sink 0.0001 pos0 0.0036 sparse 0.859 | 18s
+      step  2000 | val 1.7646 ppl 5.84 | sink 0.0001 pos0 0.0037 sparse 0.877 | 35s
+      step  3000 | val 1.6530 ppl 5.22 | sink 0.0002 pos0 0.0043 sparse 0.883 | 52s
+      step  4000 | val 1.5750 ppl 4.83 | sink 0.0002 pos0 0.0041 sparse 0.885 | 69s
+      step  5000 | val 1.5521 ppl 4.72 | sink 0.0002 pos0 0.0043 sparse 0.888 | 86s
+      Sample:  to the from the citizens many passing brother their life pardon, set when the hair done of medne consuls with it harm ladge from her kill'd in his lo
+    Total time: 85.5s
+
+
+  ============================================================
+    softmax_bf16 (seed=137)
+  ============================================================
+      step   500 | val 2.3513 ppl 10.50 | sink 0.0005 pos0 0.0073 sparse 0.822 | 4s
+      step  1000 | val 2.0386 ppl 7.68 | sink 0.0001 pos0 0.0036 sparse 0.859 | 8s
+      step  2000 | val 1.7719 ppl 5.88 | sink 0.0001 pos0 0.0036 sparse 0.876 | 16s
+      step  3000 | val 1.6539 ppl 5.23 | sink 0.0001 pos0 0.0039 sparse 0.882 | 24s
+      step  4000 | val 1.5773 ppl 4.84 | sink 0.0002 pos0 0.0040 sparse 0.886 | 31s
+      step  5000 | val 1.5554 ppl 4.74 | sink 0.0001 pos0 0.0042 sparse 0.887 | 39s
+      Sample:  to the from that into them to passing brother their life of.  SICINIUS: There is the dury palm fly. The duke.  ROMEO: Margaret's sentence and mind.  
+    Total time: 39.2s
+
+
+  ============================================================
+    sp2norm_eager (seed=137)
+  ============================================================
+      step   500 | val 2.3661 ppl 10.66 | sink 0.0010 pos0 0.0084 sparse 0.820 | 17s
+      step  1000 | val 2.0548 ppl 7.81 | sink 0.0001 pos0 0.0042 sparse 0.850 | 35s
+      step  2000 | val 1.7613 ppl 5.82 | sink 0.0001 pos0 0.0042 sparse 0.869 | 68s
+      step  3000 | val 1.6507 ppl 5.21 | sink 0.0002 pos0 0.0046 sparse 0.878 | 102s
+      step  4000 | val 1.5741 ppl 4.83 | sink 0.0003 pos0 0.0047 sparse 0.879 | 136s
+      step  5000 | val 1.5501 ppl 4.71 | sink 0.0003 pos0 0.0048 sparse 0.881 | 169s
+      Sample:   MENESONIUS: The dest nobles, passing brother Meach on?  CORIOLANUS: A weep, as it do the power: your tongue.  ROMEO: You have made the gods friar, n
+    Total time: 168.9s
+
+
+  ============================================================
+    sp2norm_fused (seed=137)
+  ============================================================
+      step   500 | val 2.3654 ppl 10.65 | sink 0.0010 pos0 0.0083 sparse 0.821 | 4s
+      step  1000 | val 2.0594 ppl 7.84 | sink 0.0001 pos0 0.0043 sparse 0.849 | 8s
+      step  2000 | val 1.7654 ppl 5.84 | sink 0.0001 pos0 0.0041 sparse 0.868 | 16s
+      step  3000 | val 1.6492 ppl 5.20 | sink 0.0001 pos0 0.0045 sparse 0.875 | 24s
+      step  4000 | val 1.5721 ppl 4.82 | sink 0.0001 pos0 0.0043 sparse 0.878 | 32s
+      step  5000 | val 1.5467 ppl 4.70 | sink 0.0001 pos0 0.0042 sparse 0.881 | 40s
+      Sample:  the friends that in the comfort of the reaps: My conquected whiless have been himself these deedly. That wilt it her words to the duke.  First Murder
+    Total time: 40.1s
+
+
+################################################################################
+  SEED = 2024
+################################################################################
+
+  ============================================================
+    softmax_fp32 (seed=2024)
+  ============================================================
+      step   500 | val 2.3599 ppl 10.59 | sink 0.0006 pos0 0.0072 sparse 0.823 | 9s
+      step  1000 | val 2.0681 ppl 7.91 | sink 0.0001 pos0 0.0033 sparse 0.853 | 17s
+      step  2000 | val 1.7841 ppl 5.95 | sink 0.0001 pos0 0.0035 sparse 0.875 | 34s
+      step  3000 | val 1.6573 ppl 5.25 | sink 0.0001 pos0 0.0040 sparse 0.880 | 50s
+      step  4000 | val 1.5959 ppl 4.93 | sink 0.0001 pos0 0.0042 sparse 0.884 | 67s
+      step  5000 | val 1.5643 ppl 4.78 | sink 0.0003 pos0 0.0049 sparse 0.886 | 84s
+      Sample:  Come, my lord, Claugh, the nurser's face? As I w have been to the counsel, brother broke the grief, more heart this execumer, Against the will will h
+    Total time: 83.9s
+
+
+  ============================================================
+    softmax_bf16 (seed=2024)
+  ============================================================
+      step   500 | val 2.3611 ppl 10.60 | sink 0.0006 pos0 0.0072 sparse 0.823 | 4s
+      step  1000 | val 2.0690 ppl 7.92 | sink 0.0001 pos0 0.0035 sparse 0.854 | 8s
+      step  2000 | val 1.7904 ppl 5.99 | sink 0.0001 pos0 0.0035 sparse 0.875 | 16s
+      step  3000 | val 1.6611 ppl 5.27 | sink 0.0001 pos0 0.0038 sparse 0.881 | 23s
+      step  4000 | val 1.5919 ppl 4.91 | sink 0.0001 pos0 0.0041 sparse 0.885 | 31s
+      step  5000 | val 1.5622 ppl 4.77 | sink 0.0004 pos0 0.0049 sparse 0.887 | 39s
+      Sample:  COMIO: And with the cousin, what old meet the ma hard? I know they were means our word: where is were here?  SICINIUS: Why camest to the places?  BIS
+    Total time: 38.8s
+
+
+  ============================================================
+    sp2norm_eager (seed=2024)
+  ============================================================
+      step   500 | val 2.3640 ppl 10.63 | sink 0.0005 pos0 0.0073 sparse 0.820 | 17s
+      step  1000 | val 2.0609 ppl 7.85 | sink 0.0002 pos0 0.0042 sparse 0.847 | 34s
+      step  2000 | val 1.7722 ppl 5.88 | sink 0.0001 pos0 0.0036 sparse 0.869 | 68s
+      step  3000 | val 1.6413 ppl 5.16 | sink 0.0001 pos0 0.0037 sparse 0.876 | 101s
+      step  4000 | val 1.5877 ppl 4.89 | sink 0.0001 pos0 0.0039 sparse 0.879 | 135s
+      step  5000 | val 1.5577 ppl 4.75 | sink 0.0001 pos0 0.0040 sparse 0.881 | 169s
+      Sample:  Come, my lord, Clarin, the craver'st me: We have him been prove my weaved, browd, Abideed, I give this I have beginfered, Or the honour'd with the au
+    Total time: 168.8s
+
+
+  ============================================================
+    sp2norm_fused (seed=2024)
+  ============================================================
+      step   500 | val 2.3649 ppl 10.64 | sink 0.0005 pos0 0.0073 sparse 0.821 | 4s
+      step  1000 | val 2.0613 ppl 7.86 | sink 0.0002 pos0 0.0042 sparse 0.847 | 8s
+      step  2000 | val 1.7704 ppl 5.87 | sink 0.0001 pos0 0.0036 sparse 0.868 | 16s
+      step  3000 | val 1.6388 ppl 5.15 | sink 0.0001 pos0 0.0038 sparse 0.875 | 24s
+      step  4000 | val 1.5867 ppl 4.89 | sink 0.0002 pos0 0.0041 sparse 0.878 | 33s
+      step  5000 | val 1.5554 ppl 4.74 | sink 0.0003 pos0 0.0040 sparse 0.883 | 42s
+      Sample:  Come, my lord, Clarence, the died look of As I T have their received; And, brother breath, I give this I have beginfellor; And then with things the h
+    Total time: 41.6s
+
+
+================================================================================
+FINAL REPORT — TANK vs TANK (10 SEEDS)
+================================================================================
+
+  --- Per-Seed Val Loss @ step 5000 ---
+             Variant  seed=   42  seed=  137  seed= 2024        mean       std
+  --------------------------------------------------------------------------------
+        softmax_fp32      1.5666      1.5521      1.5643      1.5610    0.0064
+        softmax_bf16      1.5686      1.5554      1.5622      1.5620    0.0054
+       sp2norm_eager      1.5528      1.5501      1.5577      1.5535    0.0032
+       sp2norm_fused      1.5459      1.5467      1.5554      1.5493    0.0043
+
+  ============================================================
+  THE MAIN EVENT: bf16 vs bf16 (fair fight)
+  ============================================================
+             Variant      Val     ±std      PPL   Sparse     Time   vs SM_bf16  Speedup
+  ------------------------------------------------------------------------------------------
+        softmax_bf16   1.5620   0.0054     4.77    0.887     39s      BASELINE    1.00x
+       sp2norm_fused   1.5493   0.0043     4.71    0.882     40s        -0.81%    0.96x
+
+  --- Full Comparison (all variants) ---
+             Variant      Val     ±std      PPL   Sparse     Time   vs SM_fp32
+  ----------------------------------------------------------------------------------
+        softmax_fp32   1.5610   0.0064     4.76    0.887     85s      BASELINE
+        softmax_bf16   1.5620   0.0054     4.77    0.887     39s        +0.07%
+       sp2norm_eager   1.5535   0.0032     4.73    0.882    169s        -0.48%
+       sp2norm_fused   1.5493   0.0043     4.71    0.882     40s        -0.75%
+
+  --- Averaged Val Loss Curve ---
+    Step        softmax_fp32        softmax_bf16       sp2norm_eager       sp2norm_fused
+  ----------------------------------------------------------------------------------------
+     500              2.3558              2.3569              2.3621              2.3620
+    1000              2.0501              2.0491              2.0563              2.0565
+    2000              1.7751              1.7789              1.7665              1.7661
+    3000              1.6592              1.6591              1.6478              1.6438
+    4000              1.5939              1.5929              1.5858              1.5840
+    5000              1.5610              1.5620              1.5535              1.5493
+
+  --- Significance (per-seed wins) ---
+  sp2norm_fused beats softmax_bf16 in 3/3 seeds
+  sp2norm_fused beats softmax_fp32 in 3/3 seeds
+  sp2norm_eager beats softmax_bf16 in 3/3 seeds
+  sp2norm_eager beats softmax_fp32 in 3/3 seeds
+
+================================================================================
+DONE
+================================================================================

@@ -1,0 +1,288 @@
+================================================================================
+LONG-CONTEXT v2: GIVING SP2NORM THE RUNWAY
+================================================================================
+GPU: NVIDIA GeForce RTX 4090
+
+################################################################################
+  CTX = 512, BATCH = 16, STEPS = 6000
+  Config: 6L/6H/192d, seeds=[42, 137, 2024]
+################################################################################
+
+  softmax_bf16 (seed=42, ctx=512)
+      step   500 | val 2.4705 ppl 11.83 | 4s
+      step  1000 | val 2.2688 ppl 9.67 | 8s
+      step  1500 | val 2.0619 ppl 7.86 | 12s
+      step  2000 | val 1.9035 ppl 6.71 | 16s
+      step  2500 | val 1.8183 ppl 6.16 | 20s
+      step  3000 | val 1.7608 ppl 5.82 | 24s
+      step  3500 | val 1.6938 ppl 5.44 | 28s
+      step  4000 | val 1.6679 ppl 5.30 | 32s
+      step  4500 | val 1.6341 ppl 5.12 | 36s
+      step  5000 | val 1.6240 ppl 5.07 | 41s
+      step  5500 | val 1.5885 ppl 4.90 | 45s
+      step  6000 | val 1.5819 ppl 4.86 | 50s
+    Total: 49.7s
+
+  sp2norm_fused (seed=42, ctx=512)
+      step   500 | val 2.4710 ppl 11.83 | 5s
+      step  1000 | val 2.3667 ppl 10.66 | 9s
+      step  1500 | val 2.1225 ppl 8.35 | 14s
+      step  2000 | val 1.9552 ppl 7.07 | 19s
+      step  2500 | val 1.8444 ppl 6.32 | 24s
+      step  3000 | val 1.7796 ppl 5.93 | 29s
+      step  3500 | val 1.7012 ppl 5.48 | 33s
+      step  4000 | val 1.6598 ppl 5.26 | 38s
+      step  4500 | val 1.6265 ppl 5.09 | 43s
+      step  5000 | val 1.6164 ppl 5.04 | 47s
+      step  5500 | val 1.5779 ppl 4.84 | 52s
+      step  6000 | val 1.5781 ppl 4.85 | 57s
+    Total: 56.9s
+
+  softmax_bf16 (seed=137, ctx=512)
+      step   500 | val 2.4788 ppl 11.93 | 5s
+      step  1000 | val 2.2560 ppl 9.55 | 9s
+      step  1500 | val 2.0486 ppl 7.76 | 14s
+      step  2000 | val 1.9014 ppl 6.70 | 19s
+      step  2500 | val 1.8285 ppl 6.22 | 23s
+      step  3000 | val 1.7572 ppl 5.80 | 28s
+      step  3500 | val 1.7088 ppl 5.52 | 32s
+      step  4000 | val 1.6739 ppl 5.33 | 37s
+      step  4500 | val 1.6410 ppl 5.16 | 42s
+      step  5000 | val 1.6328 ppl 5.12 | 46s
+      step  5500 | val 1.6101 ppl 5.00 | 51s
+      step  6000 | val 1.5752 ppl 4.83 | 56s
+    Total: 55.6s
+
+  sp2norm_fused (seed=137, ctx=512)
+      step   500 | val 2.4802 ppl 11.94 | 5s
+      step  1000 | val 2.3492 ppl 10.48 | 9s
+      step  1500 | val 2.1000 ppl 8.17 | 14s
+      step  2000 | val 1.9367 ppl 6.94 | 19s
+      step  2500 | val 1.8469 ppl 6.34 | 23s
+      step  3000 | val 1.7701 ppl 5.87 | 28s
+      step  3500 | val 1.7265 ppl 5.62 | 33s
+      step  4000 | val 1.6773 ppl 5.35 | 37s
+      step  4500 | val 1.6397 ppl 5.15 | 42s
+      step  5000 | val 1.6230 ppl 5.07 | 46s
+      step  5500 | val 1.6104 ppl 5.00 | 51s
+      step  6000 | val 1.5725 ppl 4.82 | 55s
+    Total: 54.6s
+
+  softmax_bf16 (seed=2024, ctx=512)
+      step   500 | val 2.4665 ppl 11.78 | 4s
+      step  1000 | val 2.2519 ppl 9.51 | 8s
+      step  1500 | val 2.0543 ppl 7.80 | 12s
+      step  2000 | val 1.9188 ppl 6.81 | 16s
+      step  2500 | val 1.8378 ppl 6.28 | 21s
+      step  3000 | val 1.7775 ppl 5.91 | 25s
+      step  3500 | val 1.7132 ppl 5.55 | 29s
+      step  4000 | val 1.6886 ppl 5.41 | 33s
+      step  4500 | val 1.6456 ppl 5.18 | 37s
+      step  5000 | val 1.6404 ppl 5.16 | 41s
+      step  5500 | val 1.6166 ppl 5.04 | 45s
+      step  6000 | val 1.6127 ppl 5.02 | 49s
+    Total: 49.0s
+
+  sp2norm_fused (seed=2024, ctx=512)
+      step   500 | val 2.4741 ppl 11.87 | 4s
+      step  1000 | val 2.3419 ppl 10.40 | 8s
+      step  1500 | val 2.0989 ppl 8.16 | 12s
+      step  2000 | val 1.9405 ppl 6.96 | 16s
+      step  2500 | val 1.8460 ppl 6.33 | 20s
+      step  3000 | val 1.7846 ppl 5.96 | 24s
+      step  3500 | val 1.7167 ppl 5.57 | 28s
+      step  4000 | val 1.6887 ppl 5.41 | 32s
+      step  4500 | val 1.6411 ppl 5.16 | 36s
+      step  5000 | val 1.6349 ppl 5.13 | 41s
+      step  5500 | val 1.6070 ppl 4.99 | 45s
+      step  6000 | val 1.6039 ppl 4.97 | 49s
+    Total: 48.9s
+
+  ============================================================
+  RESULTS: CTX=512, STEPS=6000
+  ============================================================
+
+  --- Learning Curve (mean over seeds) ---
+      Step    softmax_bf16   sp2norm_fused       gap
+  --------------------------------------------------
+       500          2.4720          2.4751    +0.13%
+      1000          2.2589          2.3526    +4.15%
+      1500          2.0549          2.1072    +2.54%
+      2000          1.9079          1.9441    +1.90%
+      2500          1.8282          1.8458    +0.96%
+      3000          1.7652          1.7781    +0.73%
+      3500          1.7053          1.7148    +0.56%
+      4000          1.6768          1.6752    -0.09% <-- CROSSOVER
+      4500          1.6403          1.6358    -0.27% <-- CROSSOVER
+      5000          1.6324          1.6248    -0.47% <-- CROSSOVER
+      5500          1.6051          1.5984    -0.42% <-- CROSSOVER
+      6000          1.5899          1.5848    -0.32% <-- CROSSOVER
+
+  --- Final Results ---
+
+             Variant  seed=   42  seed=  137  seed= 2024        mean    time   speedup
+  --------------------------------------------------------------------------------
+        softmax_bf16      1.5819      1.5752      1.6127      1.5899     51s     1.00x
+       sp2norm_fused      1.5781      1.5725      1.6039      1.5848     53s     0.96x
+
+  sp2norm_fused beats softmax_bf16: 3/3 seeds
+  Quality gap: -0.32%
+  Speed: 0.96x
+
+################################################################################
+  CTX = 1024, BATCH = 8, STEPS = 8000
+  Config: 6L/6H/192d, seeds=[42, 137, 2024]
+################################################################################
+
+  softmax_bf16 (seed=42, ctx=1024)
+      step   500 | val 2.4891 ppl 12.05 | 4s
+      step  1000 | val 2.4808 ppl 11.95 | 8s
+      step  1500 | val 2.3831 ppl 10.84 | 13s
+      step  2000 | val 2.1922 ppl 8.95 | 17s
+      step  2500 | val 2.0060 ppl 7.43 | 21s
+      step  3000 | val 1.9072 ppl 6.73 | 25s
+      step  3500 | val 1.8271 ppl 6.22 | 30s
+      step  4000 | val 1.7539 ppl 5.78 | 34s
+      step  4500 | val 1.7259 ppl 5.62 | 38s
+      step  5000 | val 1.7115 ppl 5.54 | 42s
+      step  5500 | val 1.6760 ppl 5.34 | 46s
+      step  6000 | val 1.6387 ppl 5.15 | 50s
+      step  6500 | val 1.6291 ppl 5.10 | 55s
+      step  7000 | val 1.6038 ppl 4.97 | 59s
+      step  7500 | val 1.6023 ppl 4.96 | 63s
+      step  8000 | val 1.5683 ppl 4.80 | 67s
+    Total: 66.8s
+
+  sp2norm_fused (seed=42, ctx=1024)
+      step   500 | val 2.4876 ppl 12.03 | 4s
+      step  1000 | val 2.4829 ppl 11.98 | 8s
+      step  1500 | val 2.4464 ppl 11.55 | 13s
+      step  2000 | val 2.3973 ppl 10.99 | 17s
+      step  2500 | val 2.1902 ppl 8.94 | 21s
+      step  3000 | val 2.0349 ppl 7.65 | 26s
+      step  3500 | val 1.9092 ppl 6.75 | 30s
+      step  4000 | val 1.8106 ppl 6.11 | 35s
+      step  4500 | val 1.7785 ppl 5.92 | 39s
+      step  5000 | val 1.7587 ppl 5.80 | 43s
+      step  5500 | val 1.7165 ppl 5.57 | 48s
+      step  6000 | val 1.6815 ppl 5.37 | 52s
+      step  6500 | val 1.6670 ppl 5.30 | 56s
+      step  7000 | val 1.6376 ppl 5.14 | 61s
+      step  7500 | val 1.6349 ppl 5.13 | 66s
+      step  8000 | val 1.6083 ppl 4.99 | 71s
+    Total: 70.5s
+
+  softmax_bf16 (seed=137, ctx=1024)
+      step   500 | val 2.4889 ppl 12.05 | 4s
+      step  1000 | val 2.4651 ppl 11.76 | 8s
+      step  1500 | val 2.3501 ppl 10.49 | 12s
+      step  2000 | val 2.1218 ppl 8.35 | 16s
+      step  2500 | val 1.9864 ppl 7.29 | 20s
+      step  3000 | val 1.8827 ppl 6.57 | 25s
+      step  3500 | val 1.8364 ppl 6.27 | 30s
+      step  4000 | val 1.7844 ppl 5.96 | 34s
+      step  4500 | val 1.7294 ppl 5.64 | 39s
+      step  5000 | val 1.7045 ppl 5.50 | 44s
+      step  5500 | val 1.6739 ppl 5.33 | 48s
+      step  6000 | val 1.6675 ppl 5.30 | 53s
+      step  6500 | val 1.6337 ppl 5.12 | 58s
+      step  7000 | val 1.6305 ppl 5.11 | 63s
+      step  7500 | val 1.6174 ppl 5.04 | 68s
+      step  8000 | val 1.5911 ppl 4.91 | 72s
+    Total: 72.2s
+
+  sp2norm_fused (seed=137, ctx=1024)
+      step   500 | val 2.4866 ppl 12.02 | 5s
+      step  1000 | val 2.4751 ppl 11.88 | 9s
+      step  1500 | val 2.4379 ppl 11.45 | 14s
+      step  2000 | val 2.2828 ppl 9.80 | 19s
+      step  2500 | val 2.1002 ppl 8.17 | 24s
+      step  3000 | val 1.9519 ppl 7.04 | 29s
+      step  3500 | val 1.8767 ppl 6.53 | 33s
+      step  4000 | val 1.8028 ppl 6.07 | 38s
+      step  4500 | val 1.7472 ppl 5.74 | 42s
+      step  5000 | val 1.7165 ppl 5.57 | 46s
+      step  5500 | val 1.6891 ppl 5.41 | 51s
+      step  6000 | val 1.6785 ppl 5.36 | 55s
+      step  6500 | val 1.6422 ppl 5.17 | 60s
+      step  7000 | val 1.6353 ppl 5.13 | 65s
+      step  7500 | val 1.6339 ppl 5.12 | 70s
+      step  8000 | val 1.6057 ppl 4.98 | 75s
+    Total: 74.9s
+
+  softmax_bf16 (seed=2024, ctx=1024)
+      step   500 | val 2.4929 ppl 12.10 | 5s
+      step  1000 | val 2.4686 ppl 11.81 | 10s
+      step  1500 | val 2.3443 ppl 10.43 | 14s
+      step  2000 | val 2.1469 ppl 8.56 | 19s
+      step  2500 | val 1.9851 ppl 7.28 | 24s
+      step  3000 | val 1.8996 ppl 6.68 | 28s
+      step  3500 | val 1.8239 ppl 6.20 | 33s
+      step  4000 | val 1.7467 ppl 5.74 | 37s
+      step  4500 | val 1.7010 ppl 5.48 | 41s
+      step  5000 | val 1.6900 ppl 5.42 | 46s
+      step  5500 | val 1.6437 ppl 5.17 | 50s
+      step  6000 | val 1.6371 ppl 5.14 | 54s
+      step  6500 | val 1.6000 ppl 4.95 | 58s
+      step  7000 | val 1.5996 ppl 4.95 | 62s
+      step  7500 | val 1.5917 ppl 4.91 | 67s
+      step  8000 | val 1.5721 ppl 4.82 | 71s
+    Total: 70.8s
+
+  sp2norm_fused (seed=2024, ctx=1024)
+      step   500 | val 2.4941 ppl 12.11 | 4s
+      step  1000 | val 2.4791 ppl 11.93 | 9s
+      step  1500 | val 2.4284 ppl 11.34 | 13s
+      step  2000 | val 2.3091 ppl 10.07 | 18s
+      step  2500 | val 2.1112 ppl 8.26 | 22s
+      step  3000 | val 1.9855 ppl 7.28 | 27s
+      step  3500 | val 1.8964 ppl 6.66 | 31s
+      step  4000 | val 1.8047 ppl 6.08 | 36s
+      step  4500 | val 1.7482 ppl 5.74 | 41s
+      step  5000 | val 1.7324 ppl 5.65 | 46s
+      step  5500 | val 1.6748 ppl 5.34 | 51s
+      step  6000 | val 1.6600 ppl 5.26 | 55s
+      step  6500 | val 1.6323 ppl 5.12 | 60s
+      step  7000 | val 1.6245 ppl 5.08 | 65s
+      step  7500 | val 1.6097 ppl 5.00 | 69s
+      step  8000 | val 1.5995 ppl 4.95 | 74s
+    Total: 73.9s
+
+  ============================================================
+  RESULTS: CTX=1024, STEPS=8000
+  ============================================================
+
+  --- Learning Curve (mean over seeds) ---
+      Step    softmax_bf16   sp2norm_fused       gap
+  --------------------------------------------------
+       500          2.4903          2.4894    -0.03%
+      1000          2.4715          2.4790    +0.30%
+      1500          2.3592          2.4376    +3.32%
+      2000          2.1537          2.3297    +8.18%
+      2500          1.9925          2.1339    +7.10%
+      3000          1.8965          1.9908    +4.97%
+      3500          1.8291          1.8941    +3.55%
+      4000          1.7616          1.8060    +2.52%
+      4500          1.7188          1.7579    +2.28%
+      5000          1.7020          1.7359    +1.99%
+      5500          1.6645          1.6935    +1.74%
+      6000          1.6478          1.6734    +1.55%
+      6500          1.6209          1.6472    +1.62%
+      7000          1.6113          1.6325    +1.32%
+      7500          1.6038          1.6262    +1.39%
+      8000          1.5771          1.6045    +1.74%
+
+  --- Final Results ---
+
+             Variant  seed=   42  seed=  137  seed= 2024        mean    time   speedup
+  --------------------------------------------------------------------------------
+        softmax_bf16      1.5683      1.5911      1.5721      1.5771     70s     1.00x
+       sp2norm_fused      1.6083      1.6057      1.5995      1.6045     73s     0.96x
+
+  sp2norm_fused beats softmax_bf16: 0/3 seeds
+  Quality gap: +1.74%
+  Speed: 0.96x
+
+================================================================================
+DONE
+================================================================================

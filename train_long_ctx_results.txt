@@ -1,0 +1,152 @@
+================================================================================
+LONG-CONTEXT TRAINING: WHERE ATTENTION DOMINATES
+================================================================================
+GPU: NVIDIA GeForce RTX 4090
+
+################################################################################
+  CTX = 512, BATCH = 16
+  Config: 6L/6H/192d, steps=3000, seeds=[42, 137, 2024]
+################################################################################
+
+  softmax_bf16 (seed=42, ctx=512)
+      step   500 | val 2.4705 ppl 11.83 | 4s
+      step  1000 | val 2.2705 ppl 9.68 | 8s
+      step  1500 | val 2.0619 ppl 7.86 | 12s
+      step  2000 | val 1.9038 ppl 6.71 | 16s
+      step  2500 | val 1.8172 ppl 6.15 | 20s
+      step  3000 | val 1.7603 ppl 5.81 | 25s
+    Total: 24.7s
+
+  sp2norm_fused (seed=42, ctx=512)
+      step   500 | val 2.4710 ppl 11.83 | 4s
+      step  1000 | val 2.3667 ppl 10.66 | 9s
+      step  1500 | val 2.1225 ppl 8.35 | 13s
+      step  2000 | val 1.9552 ppl 7.07 | 18s
+      step  2500 | val 1.8444 ppl 6.32 | 22s
+      step  3000 | val 1.7796 ppl 5.93 | 26s
+    Total: 26.3s
+
+  softmax_bf16 (seed=137, ctx=512)
+      step   500 | val 2.4788 ppl 11.93 | 4s
+      step  1000 | val 2.2562 ppl 9.55 | 9s
+      step  1500 | val 2.0478 ppl 7.75 | 13s
+      step  2000 | val 1.9017 ppl 6.70 | 17s
+      step  2500 | val 1.8285 ppl 6.22 | 22s
+      step  3000 | val 1.7549 ppl 5.78 | 26s
+    Total: 25.7s
+
+  sp2norm_fused (seed=137, ctx=512)
+      step   500 | val 2.4802 ppl 11.94 | 4s
+      step  1000 | val 2.3492 ppl 10.48 | 8s
+      step  1500 | val 2.1000 ppl 8.17 | 13s
+      step  2000 | val 1.9367 ppl 6.94 | 17s
+      step  2500 | val 1.8469 ppl 6.34 | 21s
+      step  3000 | val 1.7701 ppl 5.87 | 26s
+    Total: 25.8s
+
+  softmax_bf16 (seed=2024, ctx=512)
+      step   500 | val 2.4663 ppl 11.78 | 4s
+      step  1000 | val 2.2523 ppl 9.51 | 8s
+      step  1500 | val 2.0546 ppl 7.80 | 13s
+      step  2000 | val 1.9185 ppl 6.81 | 17s
+      step  2500 | val 1.8381 ppl 6.28 | 21s
+      step  3000 | val 1.7780 ppl 5.92 | 25s
+    Total: 25.3s
+
+  sp2norm_fused (seed=2024, ctx=512)
+      step   500 | val 2.4741 ppl 11.87 | 4s
+      step  1000 | val 2.3419 ppl 10.40 | 8s
+      step  1500 | val 2.0989 ppl 8.16 | 12s
+      step  2000 | val 1.9405 ppl 6.96 | 16s
+      step  2500 | val 1.8460 ppl 6.33 | 20s
+      step  3000 | val 1.7846 ppl 5.96 | 24s
+    Total: 24.3s
+
+  ============================================================
+  RESULTS: CTX=512
+  ============================================================
+
+             Variant  seed=   42  seed=  137  seed= 2024        mean    time   speedup
+  --------------------------------------------------------------------------------
+        softmax_bf16      1.7603      1.7549      1.7780      1.7644     25s     1.00x
+       sp2norm_fused      1.7796      1.7701      1.7846      1.7781     25s     0.99x
+
+  sp2norm_fused beats softmax_bf16: 0/3 seeds
+  Quality gap: +0.78%
+  Speed: 0.99x
+
+################################################################################
+  CTX = 1024, BATCH = 8
+  Config: 6L/6H/192d, steps=3000, seeds=[42, 137, 2024]
+################################################################################
+
+  softmax_bf16 (seed=42, ctx=1024)
+      step   500 | val 2.4891 ppl 12.05 | 4s
+      step  1000 | val 2.4808 ppl 11.95 | 9s
+      step  1500 | val 2.3833 ppl 10.84 | 14s
+      step  2000 | val 2.1924 ppl 8.96 | 18s
+      step  2500 | val 2.0039 ppl 7.42 | 23s
+      step  3000 | val 1.9069 ppl 6.73 | 27s
+    Total: 26.8s
+
+  sp2norm_fused (seed=42, ctx=1024)
+      step   500 | val 2.4876 ppl 12.03 | 4s
+      step  1000 | val 2.4829 ppl 11.98 | 8s
+      step  1500 | val 2.4464 ppl 11.55 | 13s
+      step  2000 | val 2.3973 ppl 10.99 | 17s
+      step  2500 | val 2.1902 ppl 8.94 | 21s
+      step  3000 | val 2.0349 ppl 7.65 | 25s
+    Total: 25.1s
+
+  softmax_bf16 (seed=137, ctx=1024)
+      step   500 | val 2.4889 ppl 12.05 | 4s
+      step  1000 | val 2.4651 ppl 11.76 | 8s
+      step  1500 | val 2.3506 ppl 10.49 | 12s
+      step  2000 | val 2.1201 ppl 8.33 | 16s
+      step  2500 | val 1.9851 ppl 7.28 | 20s
+      step  3000 | val 1.8811 ppl 6.56 | 24s
+    Total: 24.3s
+
+  sp2norm_fused (seed=137, ctx=1024)
+      step   500 | val 2.4866 ppl 12.02 | 4s
+      step  1000 | val 2.4751 ppl 11.88 | 8s
+      step  1500 | val 2.4379 ppl 11.45 | 12s
+      step  2000 | val 2.2828 ppl 9.80 | 17s
+      step  2500 | val 2.1002 ppl 8.17 | 21s
+      step  3000 | val 1.9519 ppl 7.04 | 25s
+    Total: 24.9s
+
+  softmax_bf16 (seed=2024, ctx=1024)
+      step   500 | val 2.4929 ppl 12.10 | 4s
+      step  1000 | val 2.4687 ppl 11.81 | 8s
+      step  1500 | val 2.3469 ppl 10.45 | 12s
+      step  2000 | val 2.1470 ppl 8.56 | 16s
+      step  2500 | val 1.9855 ppl 7.28 | 20s
+      step  3000 | val 1.8978 ppl 6.67 | 24s
+    Total: 24.1s
+
+  sp2norm_fused (seed=2024, ctx=1024)
+      step   500 | val 2.4941 ppl 12.11 | 4s
+      step  1000 | val 2.4791 ppl 11.93 | 8s
+      step  1500 | val 2.4284 ppl 11.34 | 13s
+      step  2000 | val 2.3091 ppl 10.07 | 17s
+      step  2500 | val 2.1112 ppl 8.26 | 22s
+      step  3000 | val 1.9855 ppl 7.28 | 26s
+    Total: 25.8s
+
+  ============================================================
+  RESULTS: CTX=1024
+  ============================================================
+
+             Variant  seed=   42  seed=  137  seed= 2024        mean    time   speedup
+  --------------------------------------------------------------------------------
+        softmax_bf16      1.9069      1.8811      1.8978      1.8952     25s     1.00x
+       sp2norm_fused      2.0349      1.9519      1.9855      1.9908     25s     0.99x
+
+  sp2norm_fused beats softmax_bf16: 0/3 seeds
+  Quality gap: +5.04%
+  Speed: 0.99x
+
+================================================================================
+DONE
+================================================================================

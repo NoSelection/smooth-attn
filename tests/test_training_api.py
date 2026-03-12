@@ -94,6 +94,38 @@ def test_flash_attention_matches_eager(seq_len):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_flash_attention_exact_math_matches_eager():
+    B, H, T, D = 2, 4, 256, 32
+    q = torch.randn(B, H, T, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, H, T, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, H, T, D, device="cuda", dtype=torch.bfloat16)
+
+    out_flash = sp2norm_flash_attention(q, k, v, exact_math=True)
+    out_eager = sp2norm_flash_attention_eager(q, k, v)
+
+    assert not out_flash.isnan().any(), "NaN in exact-math flash output"
+    torch.testing.assert_close(out_flash.float(), out_eager.float(), atol=2e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_flash_attention_noncontiguous_matches_eager():
+    B, T, H_q, H_kv, D, W = 2, 128, 8, 2, 32, 32
+    q = torch.randn(B, T, H_q, D, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    k = torch.randn(B, T, H_kv, D, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    v = torch.randn(B, T, H_kv, D, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+
+    assert not q.is_contiguous()
+    assert not k.is_contiguous()
+    assert not v.is_contiguous()
+
+    out_flash = sp2norm_flash_attention(q, k, v, window_size=W)
+    out_eager = sp2norm_flash_attention_eager(q, k, v, window_size=W)
+
+    assert not out_flash.isnan().any(), "NaN in non-contiguous flash output"
+    torch.testing.assert_close(out_flash.float(), out_eager.float(), atol=2e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_flash_attention_backward():
     import math
     from smooth_attn import softplus_norm_causal_eager
@@ -116,6 +148,56 @@ def test_flash_attention_backward():
     scores = torch.matmul(q_ref, k_ref.transpose(-2, -1)) * scale
     attn = softplus_norm_causal_eager(scores)
     (torch.matmul(attn, v_ref) * upstream).sum().backward()
+
+    torch.testing.assert_close(dq_flash.float(), q_ref.grad.float(), atol=5e-2, rtol=0.1)
+    torch.testing.assert_close(dk_flash.float(), k_ref.grad.float(), atol=5e-2, rtol=0.1)
+    torch.testing.assert_close(dv_flash.float(), v_ref.grad.float(), atol=5e-2, rtol=0.1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_flash_attention_exact_math_backward():
+    B, H, T, D = 1, 2, 64, 32
+    q = torch.randn(B, H, T, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(B, H, T, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(B, H, T, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    upstream = torch.randn(B, H, T, D, device="cuda", dtype=torch.float32)
+
+    out = sp2norm_flash_attention(q, k, v, exact_math=True)
+    (out.float() * upstream).sum().backward()
+    dq_flash, dk_flash, dv_flash = q.grad.clone(), k.grad.clone(), v.grad.clone()
+
+    q_ref = q.detach().clone().float().requires_grad_(True)
+    k_ref = k.detach().clone().float().requires_grad_(True)
+    v_ref = v.detach().clone().float().requires_grad_(True)
+    out_eager = sp2norm_flash_attention_eager(q_ref, k_ref, v_ref)
+    (out_eager.float() * upstream).sum().backward()
+
+    torch.testing.assert_close(dq_flash.float(), q_ref.grad.float(), atol=5e-2, rtol=0.1)
+    torch.testing.assert_close(dk_flash.float(), k_ref.grad.float(), atol=5e-2, rtol=0.1)
+    torch.testing.assert_close(dv_flash.float(), v_ref.grad.float(), atol=5e-2, rtol=0.1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_flash_attention_noncontiguous_backward():
+    B, T, H_q, H_kv, D, W = 1, 64, 8, 2, 32, 32
+    q = torch.randn(B, T, H_q, D, device="cuda", dtype=torch.bfloat16).transpose(1, 2).detach().requires_grad_(True)
+    k = torch.randn(B, T, H_kv, D, device="cuda", dtype=torch.bfloat16).transpose(1, 2).detach().requires_grad_(True)
+    v = torch.randn(B, T, H_kv, D, device="cuda", dtype=torch.bfloat16).transpose(1, 2).detach().requires_grad_(True)
+    upstream = torch.randn(B, H_q, T, D, device="cuda", dtype=torch.float32)
+
+    assert not q.is_contiguous()
+    assert not k.is_contiguous()
+    assert not v.is_contiguous()
+
+    out = sp2norm_flash_attention(q, k, v, window_size=W)
+    (out.float() * upstream).sum().backward()
+    dq_flash, dk_flash, dv_flash = q.grad.clone(), k.grad.clone(), v.grad.clone()
+
+    q_ref = q.detach().clone().float().requires_grad_(True)
+    k_ref = k.detach().clone().float().requires_grad_(True)
+    v_ref = v.detach().clone().float().requires_grad_(True)
+    out_eager = sp2norm_flash_attention_eager(q_ref, k_ref, v_ref, window_size=W)
+    (out_eager.float() * upstream).sum().backward()
 
     torch.testing.assert_close(dq_flash.float(), q_ref.grad.float(), atol=5e-2, rtol=0.1)
     torch.testing.assert_close(dk_flash.float(), k_ref.grad.float(), atol=5e-2, rtol=0.1)
