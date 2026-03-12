@@ -1,11 +1,15 @@
 """
-LONG-CONTEXT TRAINING: Where attention dominates compute.
-==========================================================
-At ctx=256, attention is ~5% of compute. At ctx=1024+, it dominates.
-This is where kernel speed differences actually show up in wall-clock time.
+LONG-CONTEXT v2: Give sp2norm the runway it needs.
+====================================================
+At ctx=256 (5000 steps), sp2norm crosses over around step 1500-2000.
+At ctx=512 (3000 steps), gap was still closing at +0.78%.
+At ctx=1024 (3000 steps), gap closing fast at ~2%/500 steps.
 
-Only bf16 variants (the fair fight): softmax_bf16 vs sp2norm_fused
-3 seeds x 3000 steps x [ctx=512, ctx=1024]
+sp2norm has smoother gradients (squareplus vs exp) → slower warmup, better asymptote.
+Longer context = more tokens = needs more steps to sharpen attention.
+
+Fix: more steps. ctx=512 → 6000 steps, ctx=1024 → 8000 steps.
+3 seeds, bf16 only (the fair fight).
 """
 
 import torch
@@ -17,7 +21,23 @@ import sys
 import os
 
 sys.stdout.reconfigure(line_buffering=True)
-sys.path.insert(0, "src")
+
+
+def _find_repo_root():
+    here = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        if os.path.exists(os.path.join(here, "pyproject.toml")) and os.path.isdir(os.path.join(here, "src")):
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            raise RuntimeError("Could not locate repo root")
+        here = parent
+
+
+ROOT = _find_repo_root()
+SRC = os.path.join(ROOT, "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
 
 from smooth_attn import DEFAULT_FAMILY, softplus_norm_causal_eager, sp2norm_flash_attention
 
@@ -25,13 +45,20 @@ DEVICE = 'cuda'
 ATTN_DROPOUT = 0.0
 RESID_DROPOUT = 0.1
 SP2_EXACT_MATH = True
+BASE_LR = 3e-4
+MIN_LR_RATIO = 0.1
+WARMUP_RATIO = 0.05
+GRAD_CLIP_NORM = 1.0
+
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 # ============================================================
 # Data
 # ============================================================
 
-_dir = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(_dir, 'shakespeare.txt'), 'r', encoding='utf-8') as f:
+with open(os.path.join(ROOT, 'shakespeare.txt'), 'r', encoding='utf-8') as f:
     text = f.read()
 
 chars = sorted(list(set(text)))
@@ -199,13 +226,35 @@ def eval_loss(model, block_size, batch_size, n=30):
 # Training
 # ============================================================
 
-def train_variant(variant, seed, n_embd, n_head, n_layer, max_ctx, batch_size, steps):
+def make_adamw(params, lr):
+    kwargs = {"lr": lr}
+    if torch.cuda.is_available():
+        kwargs["fused"] = True
+    return torch.optim.AdamW(params, **kwargs)
+
+
+def lr_at_step(step, total_steps, base_lr):
+    warmup_steps = max(1, int(total_steps * WARMUP_RATIO))
+    min_lr = base_lr * MIN_LR_RATIO
+    if step <= warmup_steps:
+        return base_lr * step / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine
+
+
+def set_lr(opt, lr):
+    for group in opt.param_groups:
+        group["lr"] = lr
+
+
+def train_variant(variant, seed, n_embd, n_head, n_layer, max_ctx, batch_size, steps, eval_every):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
     model = build_model(variant, n_embd, n_head, n_layer, max_ctx).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    opt = make_adamw(model.parameters(), lr=BASE_LR)
 
     # Warmup (Triton compilation)
     for _ in range(3):
@@ -217,28 +266,33 @@ def train_variant(variant, seed, n_embd, n_head, n_layer, max_ctx, batch_size, s
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     model = build_model(variant, n_embd, n_head, n_layer, max_ctx).to(DEVICE)
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    opt = make_adamw(model.parameters(), lr=BASE_LR)
 
-    eval_points = [500, 1000, 1500, 2000, 2500, 3000]
+    eval_points = list(range(eval_every, steps + 1, eval_every))
+    if steps not in eval_points:
+        eval_points.append(steps)
     history = []
     next_eval = 0
 
     start = time.perf_counter()
 
     for step in range(1, steps + 1):
+        lr = lr_at_step(step, steps, BASE_LR)
+        set_lr(opt, lr)
         X, Y = get_batch('train', max_ctx, batch_size)
         _, loss = model(X, Y)
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         opt.step()
 
         if next_eval < len(eval_points) and step == eval_points[next_eval]:
             val = eval_loss(model, max_ctx, batch_size)
             t = time.perf_counter() - start
             ppl = math.exp(val)
-            print(f"      step {step:5d} | val {val:.4f} ppl {ppl:.2f} | {t:.0f}s",
+            print(f"      step {step:5d} | val {val:.4f} ppl {ppl:.2f} | lr {lr:.2e} | {t:.0f}s",
                   flush=True)
-            history.append({'step': step, 'val': val, 'ppl': ppl})
+            history.append({'step': step, 'val': val, 'ppl': ppl, 'lr': lr})
             next_eval += 1
 
     total = time.perf_counter() - start
@@ -253,26 +307,26 @@ def train_variant(variant, seed, n_embd, n_head, n_layer, max_ctx, batch_size, s
 
 if __name__ == "__main__":
     print("=" * 80, flush=True)
-    print("LONG-CONTEXT TRAINING: WHERE ATTENTION DOMINATES", flush=True)
+    print("LONG-CONTEXT v2: GIVING SP2NORM THE RUNWAY", flush=True)
     print("=" * 80, flush=True)
     print(f"GPU: {torch.cuda.get_device_name()}", flush=True)
 
     SEEDS = [42, 137, 2024]
     N_EMBD, N_HEAD, N_LAYER = 192, 6, 6
-    STEPS = 3000
 
-    # At longer ctx, reduce batch to fit in memory
+    # More steps for longer contexts — sp2norm needs runway to converge
     ctx_configs = [
-        (512, 16),    # ctx=512, batch=16
-        (1024, 8),    # ctx=1024, batch=8
+        # (ctx, batch, steps, eval_every)
+        (512,  16, 6000, 500),    # 2x more steps than v1
+        (1024,  8, 8000, 500),    # 2.7x more steps than v1
     ]
 
     variants = ['softmax_bf16', 'sp2norm_fused']
 
-    for CTX, BATCH in ctx_configs:
+    for CTX, BATCH, STEPS, EVAL_EVERY in ctx_configs:
         print(f"\n{'#'*80}", flush=True)
-        print(f"  CTX = {CTX}, BATCH = {BATCH}", flush=True)
-        print(f"  Config: {N_LAYER}L/{N_HEAD}H/{N_EMBD}d, steps={STEPS}, seeds={SEEDS}", flush=True)
+        print(f"  CTX = {CTX}, BATCH = {BATCH}, STEPS = {STEPS}", flush=True)
+        print(f"  Config: {N_LAYER}L/{N_HEAD}H/{N_EMBD}d, seeds={SEEDS}", flush=True)
         print(f"{'#'*80}", flush=True)
 
         all_results = {v: {} for v in variants}
@@ -281,16 +335,32 @@ if __name__ == "__main__":
             for variant in variants:
                 print(f"\n  {variant} (seed={seed}, ctx={CTX})", flush=True)
                 hist, total, n_params = train_variant(
-                    variant, seed, N_EMBD, N_HEAD, N_LAYER, CTX, BATCH, STEPS
+                    variant, seed, N_EMBD, N_HEAD, N_LAYER, CTX, BATCH, STEPS, EVAL_EVERY
                 )
                 all_results[variant][seed] = (hist, total, n_params)
                 print(f"    Total: {total:.1f}s", flush=True)
 
         # Report for this context length
         print(f"\n  {'='*60}", flush=True)
-        print(f"  RESULTS: CTX={CTX}", flush=True)
+        print(f"  RESULTS: CTX={CTX}, STEPS={STEPS}", flush=True)
         print(f"  {'='*60}", flush=True)
 
+        # Print full learning curve comparison
+        print(f"\n  --- Learning Curve (mean over seeds) ---")
+        sm_hists = [all_results['softmax_bf16'][s][0] for s in SEEDS]
+        sp_hists = [all_results['sp2norm_fused'][s][0] for s in SEEDS]
+        n_evals = min(len(h) for h in sm_hists + sp_hists)
+        print(f"  {'Step':>8s}  {'softmax_bf16':>14s}  {'sp2norm_fused':>14s}  {'gap':>8s}")
+        print(f"  {'-'*50}")
+        for i in range(n_evals):
+            step = sm_hists[0][i]['step']
+            sm_mean = sum(h[i]['val'] for h in sm_hists) / len(sm_hists)
+            sp_mean = sum(h[i]['val'] for h in sp_hists) / len(sp_hists)
+            gap = (sp_mean - sm_mean) / sm_mean * 100
+            marker = " <-- CROSSOVER" if i > 0 and gap <= 0 else ""
+            print(f"  {step:8d}  {sm_mean:14.4f}  {sp_mean:14.4f}  {gap:+7.2f}%{marker}")
+
+        print(f"\n  --- Final Results ---")
         print(f"\n  {'Variant':>18s}", end="")
         for seed in SEEDS:
             print(f"  seed={seed:>5d}", end="")

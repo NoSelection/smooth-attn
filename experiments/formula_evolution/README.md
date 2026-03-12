@@ -38,6 +38,17 @@ The tighter local search keeps the family fixed to the current winner:
 - mutate only `alpha`, `theta`, and `power`
 - bias the initial population around `squareplus(2 * (x - 0.5))^2 / sum`
 
+`context_adaptive_local`
+
+This search space keeps the squareplus family, but swaps the fixed global
+threshold for row-adaptive variants that may behave better at long context:
+
+- `squareplus(alpha * ((x - row_max_visible) + theta))^power / sum`
+- `squareplus(alpha * (((x - row_mean_visible) / row_std_visible) - theta))^power / sum`
+
+The idea is to restore some of the "relative to this row" geometry that
+softmax gets for free, without giving up the smooth thresholded family.
+
 All candidates are evaluated in eager mode on CUDA so the search stays generic.
 The top candidates can then be ported into Triton if they look worthwhile.
 
@@ -49,6 +60,7 @@ From the repo root:
 python3 experiments/formula_evolution/search.py --dtypes bf16 --lengths 128,256,512 --generations 6 --population 18
 python3 experiments/formula_evolution/search.py --dtypes bf16 --lengths 128,256,512,1024 --generations 8 --population 24 --save-json experiments/formula_evolution/latest.json
 python3 experiments/formula_evolution/search.py --search-space squareplus_local --dtypes bf16 --lengths 128,256,512,1024 --population 48 --generations 16 --warmup 12 --iters 30 --seeds 1234,2027,4099
+python3 experiments/formula_evolution/search.py --search-space context_adaptive_local --dtypes bf16 --lengths 128,256,512,1024 --population 48 --generations 16 --warmup 12 --iters 30 --seeds 1234,2027,4099
 ```
 
 ## Read the Output

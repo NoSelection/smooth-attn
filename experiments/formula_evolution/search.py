@@ -27,8 +27,13 @@ if str(SRC) not in sys.path:
 from smooth_attn import kernels as base
 
 
-SUPPORTED_SEARCH_SPACES = ("broad", "squareplus_local")
-SUPPORTED_CENTERS = ("fixed_theta", "row_mean_visible")
+SUPPORTED_SEARCH_SPACES = ("broad", "squareplus_local", "context_adaptive_local")
+SUPPORTED_CENTERS = (
+    "fixed_theta",
+    "row_mean_visible",
+    "row_max_visible",
+    "row_mean_std_visible",
+)
 SUPPORTED_ACTIVATIONS = ("squareplus", "softplus", "relu")
 DEFAULT_BASELINE = base.FamilyConfig(alpha=2.0, theta=0.5, power=2)
 EPS = 1e-12
@@ -66,8 +71,12 @@ class FormulaCandidate:
     def label(self):
         if self.center == "fixed_theta":
             center = f"(x - {self.theta:.3g})"
-        else:
+        elif self.center == "row_mean_visible":
             center = "(x - row_mean_visible)"
+        elif self.center == "row_max_visible":
+            center = f"((x - row_max_visible) + {self.theta:.3g})"
+        else:
+            center = f"(((x - row_mean_visible) / row_std_visible) - {self.theta:.3g})"
         return f"{self.activation}({self.alpha:.3g} * {center})^{self.power} / sum"
 
 
@@ -109,6 +118,22 @@ def _apply_activation(arg, activation):
     return torch.relu(arg)
 
 
+def _visible_mean(x_attn, mask, visible_count):
+    visible = x_attn.masked_fill(mask, 0.0)
+    return visible.sum(dim=-1, keepdim=True) / visible_count.to(visible.dtype)
+
+
+def _visible_std(x_attn, mask, visible_count, row_mean):
+    centered_visible = (x_attn - row_mean).masked_fill(mask, 0.0)
+    row_var = (centered_visible * centered_visible).sum(dim=-1, keepdim=True)
+    row_var = row_var / visible_count.to(x_attn.dtype)
+    return torch.sqrt(row_var + EPS)
+
+
+def _visible_max(x_attn, mask):
+    return x_attn.masked_fill(mask, float("-inf")).max(dim=-1, keepdim=True).values
+
+
 def candidate_causal_eager(x, candidate, *, return_aux=False):
     x_attn = base._prepare_attention_input(x)
     mask = base._causal_mask(x_attn.shape[-1], x_attn.device)
@@ -116,10 +141,16 @@ def candidate_causal_eager(x, candidate, *, return_aux=False):
 
     if candidate.center == "fixed_theta":
         centered = x_attn - candidate.theta
-    else:
-        visible = x_attn.masked_fill(mask, 0.0)
-        row_mean = visible.sum(dim=-1, keepdim=True) / visible_count.to(visible.dtype)
+    elif candidate.center == "row_mean_visible":
+        row_mean = _visible_mean(x_attn, mask, visible_count)
         centered = x_attn - row_mean
+    elif candidate.center == "row_max_visible":
+        row_max = _visible_max(x_attn, mask)
+        centered = x_attn - row_max + candidate.theta
+    else:
+        row_mean = _visible_mean(x_attn, mask, visible_count)
+        row_std = _visible_std(x_attn, mask, visible_count, row_mean).clamp_min(1e-4)
+        centered = ((x_attn - row_mean) / row_std) - candidate.theta
 
     y = _apply_activation(candidate.alpha * centered, candidate.activation)
     if candidate.power == 2:
@@ -275,6 +306,10 @@ def _seed_population():
         FormulaCandidate(center="row_mean_visible", activation="squareplus", alpha=2.0, theta=0.0, power=2),
         FormulaCandidate(center="row_mean_visible", activation="softplus", alpha=2.0, theta=0.0, power=2),
         FormulaCandidate(center="row_mean_visible", activation="relu", alpha=2.0, theta=0.0, power=2),
+        FormulaCandidate(center="row_max_visible", activation="squareplus", alpha=2.0, theta=0.5, power=2),
+        FormulaCandidate(center="row_max_visible", activation="squareplus", alpha=3.0, theta=0.75, power=2),
+        FormulaCandidate(center="row_mean_std_visible", activation="squareplus", alpha=2.0, theta=0.0, power=2),
+        FormulaCandidate(center="row_mean_std_visible", activation="squareplus", alpha=2.0, theta=0.75, power=2),
     ]
 
 
@@ -292,19 +327,48 @@ def _seed_population_squareplus_local():
     ]
 
 
+def _seed_population_context_adaptive_local():
+    return [
+        FormulaCandidate(center="row_max_visible", activation="squareplus", alpha=2.0, theta=0.25, power=2),
+        FormulaCandidate(center="row_max_visible", activation="squareplus", alpha=2.0, theta=0.5, power=2),
+        FormulaCandidate(center="row_max_visible", activation="squareplus", alpha=3.0, theta=0.75, power=2),
+        FormulaCandidate(center="row_max_visible", activation="squareplus", alpha=2.0, theta=1.0, power=3),
+        FormulaCandidate(center="row_mean_std_visible", activation="squareplus", alpha=1.5, theta=0.0, power=2),
+        FormulaCandidate(center="row_mean_std_visible", activation="squareplus", alpha=2.0, theta=0.5, power=2),
+        FormulaCandidate(center="row_mean_std_visible", activation="squareplus", alpha=2.5, theta=0.75, power=2),
+        FormulaCandidate(center="row_mean_std_visible", activation="squareplus", alpha=2.0, theta=1.0, power=1),
+        FormulaCandidate(center="row_mean_std_visible", activation="squareplus", alpha=2.0, theta=1.0, power=3),
+    ]
+
+
+def _normalize_theta_for_center(center, theta):
+    if center == "row_mean_visible":
+        return 0.0
+    if center == "row_max_visible":
+        return round(max(0.0, min(3.0, theta)), 4)
+    if center == "row_mean_std_visible":
+        return round(max(-2.0, min(3.0, theta)), 4)
+    return round(max(-2.0, min(2.0, theta)), 4)
+
+
 def _random_candidate_broad(rng):
     center = rng.choice(SUPPORTED_CENTERS)
     activation = rng.choice(SUPPORTED_ACTIVATIONS)
     alpha = rng.choice([0.5, 1.0, 1.5, 2.0, 3.0, 4.0])
-    theta = rng.choice([-0.5, 0.0, 0.25, 0.5, 0.75, 1.0])
-    power = rng.choice(base.SUPPORTED_POWERS)
-    if center == "row_mean_visible":
+    if center == "fixed_theta":
+        theta = rng.choice([-0.5, 0.0, 0.25, 0.5, 0.75, 1.0])
+    elif center == "row_mean_visible":
         theta = 0.0
+    elif center == "row_max_visible":
+        theta = rng.choice([0.0, 0.25, 0.5, 0.75, 1.0, 1.5])
+    else:
+        theta = rng.choice([-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0])
+    power = rng.choice(base.SUPPORTED_POWERS)
     return FormulaCandidate(
         center=center,
         activation=activation,
         alpha=alpha,
-        theta=theta,
+        theta=_normalize_theta_for_center(center, theta),
         power=power,
     )
 
@@ -319,9 +383,26 @@ def _random_candidate_squareplus_local(rng):
     )
 
 
+def _random_candidate_context_adaptive_local(rng):
+    center = rng.choice(["row_max_visible", "row_mean_std_visible"])
+    if center == "row_max_visible":
+        theta = rng.choice([0.0, 0.125, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5])
+    else:
+        theta = rng.choice([-0.5, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
+    return FormulaCandidate(
+        center=center,
+        activation="squareplus",
+        alpha=rng.choice([0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]),
+        theta=_normalize_theta_for_center(center, theta),
+        power=rng.choice(base.SUPPORTED_POWERS),
+    )
+
+
 def _random_candidate(rng, search_space):
     if search_space == "squareplus_local":
         return _random_candidate_squareplus_local(rng)
+    if search_space == "context_adaptive_local":
+        return _random_candidate_context_adaptive_local(rng)
     return _random_candidate_broad(rng)
 
 
@@ -343,14 +424,11 @@ def _mutate_broad(candidate, rng):
     if rng.random() < 0.25:
         power = rng.choice(base.SUPPORTED_POWERS)
 
-    if center == "row_mean_visible":
-        theta = 0.0
-
     return FormulaCandidate(
         center=center,
         activation=activation,
         alpha=round(alpha, 4),
-        theta=round(theta, 4),
+        theta=_normalize_theta_for_center(center, theta),
         power=power,
     )
 
@@ -376,9 +454,38 @@ def _mutate_squareplus_local(candidate, rng):
     )
 
 
+def _mutate_context_adaptive_local(candidate, rng):
+    center = candidate.center
+    alpha = candidate.alpha
+    theta = candidate.theta
+    power = candidate.power
+
+    if rng.random() < 0.20:
+        center = "row_mean_std_visible" if center == "row_max_visible" else "row_max_visible"
+    if rng.random() < 0.75:
+        alpha = max(0.25, min(8.0, alpha * (2.0 ** rng.uniform(-0.35, 0.35))))
+    if rng.random() < 0.70:
+        if center == "row_max_visible":
+            theta = theta + rng.choice([-0.5, -0.25, -0.125, 0.125, 0.25, 0.5])
+        else:
+            theta = theta + rng.choice([-0.5, -0.25, -0.125, 0.125, 0.25, 0.5])
+    if rng.random() < 0.20:
+        power = rng.choice(base.SUPPORTED_POWERS)
+
+    return FormulaCandidate(
+        center=center,
+        activation="squareplus",
+        alpha=round(alpha, 4),
+        theta=_normalize_theta_for_center(center, theta),
+        power=power,
+    )
+
+
 def _mutate(candidate, rng, search_space):
     if search_space == "squareplus_local":
         return _mutate_squareplus_local(candidate, rng)
+    if search_space == "context_adaptive_local":
+        return _mutate_context_adaptive_local(candidate, rng)
     return _mutate_broad(candidate, rng)
 
 
@@ -389,14 +496,11 @@ def _crossover_broad(left, right, rng):
     theta = (left.theta + right.theta) / 2.0
     power = rng.choice([left.power, right.power])
 
-    if center == "row_mean_visible":
-        theta = 0.0
-
     child = FormulaCandidate(
         center=center,
         activation=activation,
         alpha=round(alpha, 4),
-        theta=round(theta, 4),
+        theta=_normalize_theta_for_center(center, theta),
         power=power,
     )
     return _mutate_broad(child, rng)
@@ -413,9 +517,23 @@ def _crossover_squareplus_local(left, right, rng):
     return _mutate_squareplus_local(child, rng)
 
 
+def _crossover_context_adaptive_local(left, right, rng):
+    center = rng.choice([left.center, right.center])
+    child = FormulaCandidate(
+        center=center,
+        activation="squareplus",
+        alpha=round((left.alpha + right.alpha) / 2.0, 4),
+        theta=_normalize_theta_for_center(center, (left.theta + right.theta) / 2.0),
+        power=rng.choice([left.power, right.power]),
+    )
+    return _mutate_context_adaptive_local(child, rng)
+
+
 def _crossover(left, right, rng, search_space):
     if search_space == "squareplus_local":
         return _crossover_squareplus_local(left, right, rng)
+    if search_space == "context_adaptive_local":
+        return _crossover_context_adaptive_local(left, right, rng)
     return _crossover_broad(left, right, rng)
 
 
@@ -441,6 +559,8 @@ def run_search(args):
 
     if args.search_space == "squareplus_local":
         initial_population = _seed_population_squareplus_local()
+    elif args.search_space == "context_adaptive_local":
+        initial_population = _seed_population_context_adaptive_local()
     else:
         initial_population = _seed_population()
     population = _fill_population(rng, initial_population, args.population, args.search_space)
@@ -552,7 +672,7 @@ def parse_args():
         "--search-space",
         choices=SUPPORTED_SEARCH_SPACES,
         default="broad",
-        help="search over all supported families or only squareplus around the current champion",
+        help="search over all supported families, only local squareplus, or new context-adaptive squareplus variants",
     )
     parser.add_argument("--dtypes", default="bf16", help="comma-separated: fp32,fp16,bf16")
     parser.add_argument("--lengths", default="128,256,512", help="comma-separated causal sequence lengths")

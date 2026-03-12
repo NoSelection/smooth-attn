@@ -21,7 +21,23 @@ import sys
 import os
 
 sys.stdout.reconfigure(line_buffering=True)
-sys.path.insert(0, "src")
+
+
+def _find_repo_root():
+    here = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        if os.path.exists(os.path.join(here, "pyproject.toml")) and os.path.isdir(os.path.join(here, "src")):
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            raise RuntimeError("Could not locate repo root")
+        here = parent
+
+
+ROOT = _find_repo_root()
+SRC = os.path.join(ROOT, "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
 
 from smooth_attn import DEFAULT_FAMILY, softplus_norm_causal_eager, sp2norm_flash_attention
 
@@ -34,8 +50,7 @@ SP2_EXACT_MATH = True
 # Data
 # ============================================================
 
-_dir = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(_dir, 'shakespeare.txt'), 'r', encoding='utf-8') as f:
+with open(os.path.join(ROOT, 'shakespeare.txt'), 'r', encoding='utf-8') as f:
     text = f.read()
 
 chars = sorted(list(set(text)))

@@ -108,13 +108,25 @@ src/smooth_attn/
   kernels.py
 benchmarks/
   causal_benchmark.py
+experiments/
+  formula_evolution/
+  long_context/
+  mutation_showdown/
+  training/
 examples/
   mini_attention.py
+results/
+  long_context/
+  training/
 tests/
   test_family_config.py
   test_training_api.py
 triton_kernel.py
 ```
+
+Research scripts and raw result logs are kept out of the package code on purpose:
+- `experiments/` contains one-off training runs, sweeps, and formula probes.
+- `results/` contains the text logs that back those experiments.
 
 ## Notes
 
